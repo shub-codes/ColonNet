@@ -1,0 +1,2 @@
+25th march : there was a issue with dataloaders branch, it was using non bleeding images for
+segmentation and bounding box branches wich led to wrong training. Non bleedingimage shouldonly be used for training classificiation

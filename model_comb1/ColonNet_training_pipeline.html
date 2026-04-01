@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ColonNet Training Pipeline Flowchart</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom CSS for Flowchart Shapes and Arrows */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+            padding: 20px;
+        }
+
+        .flow-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .stage-title {
+            color: #003359;
+            border-bottom: 3px solid #00798C;
+            margin-bottom: 24px;
+            padding-bottom: 8px;
+            font-weight: 700;
+        }
+
+        /* General Flowchart Node Styling */
+        .flow-node {
+            padding: 1rem 1.5rem;
+            margin: 12px 0;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 600;
+            color: #fff;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+            max-width: 100%;
+        }
+
+        .flow-node:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        /* Node Types */
+        .node-start {
+            background-color: #3b82f6; /* Blue */
+        }
+        .node-process {
+            background-color: #00798C; /* Teal/Process */
+        }
+        .node-model-save {
+            background-color: #dc2626; /* Red/Checkpoint */
+        }
+        .node-hyperparams {
+            background-color: #fbb300; /* Gold/Result */
+            color: #333;
+        }
+        .node-final-end {
+            background-color: #16a34a; /* Green/Final Model */
+        }
+
+        /* Arrows (Connectors) */
+        .arrow {
+            width: 0;
+            height: 24px;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 10px solid #6b7280; /* Gray arrow tip */
+            margin: 0 auto;
+        }
+
+        .arrow-line {
+            width: 2px;
+            height: 12px;
+            background-color: #6b7280;
+            margin: 0 auto;
+        }
+    </style>
+</head>
+<body>
+
+<div class="flow-container">
+    <h1 class="text-4xl stage-title text-center mb-8">ColonNet Multi-Stage Training Pipeline</h1>
+
+    <!-- I. Hyperparameter Search (Grey Wolf Optimization) -->
+    <h2 class="text-2xl stage-title w-full">I. Hyperparameter Search (GWO)</h2>
+    <div class="w-full sm:w-3/4">
+        <div class="flow-node node-start">Start: Initialize Script</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Define `_gwo_objective` function (log10(LR), Dropout, Dense Scale)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Run GWO: Optimize `_gwo_objective` within defined bounds (1 iteration, 6 wolves simulated)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-hyperparams">OUTPUT: Best Hyperparameters (`best_lr`, `best_dropout`, `best_scale`)</div>
+    </div>
+    
+    <div class="arrow my-4"><div class="arrow-line h-8"></div></div>
+
+    <!-- II. Stage 1: Bounding Box Branch Training -->
+    <h2 class="text-2xl stage-title w-full mt-8">II. Stage 1: Bounding Box Branch Training</h2>
+    <div class="w-full sm:w-3/4">
+        <div class="flow-node node-process">Load & Split Data: Only **Bleeding Images** (`with_neg=False`, `aug=True`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Build `build_model` (Densenet) with GWO Hyperparameters</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">**Freeze Classification Layers** (`c_` layers)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Compile Model: Losses (BCE, MSE), Optimizer (AdamW with `best_lr`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Train Bounding Box Branch for **10 Epochs** (`batch_size=64`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-model-save">MODEL SAVE: `CheckPoint1.h5`</div>
+    </div>
+
+    <div class="arrow my-4"><div class="arrow-line h-8"></div></div>
+
+    <!-- III. Stage 2: Classification Branch Training -->
+    <h2 class="text-2xl stage-title w-full mt-8">III. Stage 2: Classification Branch Training</h2>
+    <div class="w-full sm:w-3/4">
+        <div class="flow-node node-process">**Load Model** from `CheckPoint1.h5`</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">**Freeze Box Layers** (`b_` layers, `densenet121`) & **Unfreeze Classification Layers** (`c_` layers)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Load & Split Data: **All Images** (`aug=False`, `nums=2`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Train Classification Branch for **10 Epochs** (`batch_size=64`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-model-save">MODEL SAVE: `classNbox.h5`</div>
+    </div>
+
+    <div class="arrow my-4"><div class="arrow-line h-8"></div></div>
+
+    <!-- IV. Stage 3: Segmentation Model Training (ResUNet) -->
+    <h2 class="text-2xl stage-title w-full mt-8">IV. Stage 3: Segmentation Model Training (ResUNet)</h2>
+    <div class="w-full sm:w-3/4">
+        <div class="flow-node node-process">Load & Split Segmentation Data (`load_data_unet`); Reshape Masks to (224, 224, 1)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Build `Build_Unet_Model`</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+        
+        <div class="flow-node node-process">Compile Model: Loss (focal_tversky), Metric (tversky), Optimizer (adam)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+        
+        <div class="flow-node node-process">Train Segmentation Model for **10 Epochs** with EarlyStopping, ModelCheckpoint, ReduceLROnPlateau</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-model-save">MODEL SAVE: `segmentation.hdf5`</div>
+    </div>
+    
+    <div class="arrow my-4"><div class="arrow-line h-8"></div></div>
+
+    <!-- V. Final Model Combination (ColonNet) -->
+    <h2 class="text-2xl stage-title w-full mt-8">V. Final Model Combination (ColonNet)</h2>
+    <div class="w-full sm:w-3/4">
+        <div class="flow-node node-process">Load `upper` model (`classNbox.h5`) & `lower` model (`segmentation.hdf5`)</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+        
+        <div class="flow-node node-process">Set all layers in both loaded models to `trainable = False`</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-process">Create Final Model: Input layer feeds into both `upper` (→ l1) and `lower` (→ l2) models</div>
+        <div class="arrow"><div class="arrow-line"></div></div>
+
+        <div class="flow-node node-final-end">END: Save Final Model as `ColonNet.h5` (Outputs: l1 and l2)</div>
+    </div>
+
+</div>
+
+</body>
+</html>
