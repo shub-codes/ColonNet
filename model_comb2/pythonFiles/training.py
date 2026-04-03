@@ -48,6 +48,14 @@ PATH_SEG   = mp("segmentation.keras")
 PATH_COLON = mp("ColonNet.keras")
 PATH_RS    = mp("rs_best_params.json")
 
+# ─────────────────────────────────────────────────────────────
+# BACKBONE LAYER NAME
+# In build_model() the MobileNetV3Small backbone is wrapped as a
+# sub-model named "MobileNetV3Small_MultiScale". That is the name
+# that appears as a layer inside the outer ColonSeg_Combo2 model.
+# FIX: original used "densenet121" — wrong for this combination.
+# ─────────────────────────────────────────────────────────────
+BACKBONE_LAYER_NAME = "MobileNetV3Small_MultiScale"
 
 # ─────────────────────────────────────────────────────────────
 # LOSSES
@@ -86,25 +94,22 @@ def smooth_l1(y_true, y_pred):
 def combined_box_loss(y_true, y_pred):
     """
     GIoU + 0.5 * smooth-L1, masked to valid (non-zero area) boxes only.
-    FIX: original applied valid_mask to the already-scalar output of
-    giou_loss + smooth_l1, making the mask a no-op (scalar * scalar).
-    The mask must be applied per-sample before reducing, so both
-    component losses are computed per-sample here.
+    Computed per-sample so the valid_mask zeroes out non-bleeding samples
+    before the mean reduction — not after (which would be a no-op).
     """
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
 
-    # per-sample valid mask: box has non-zero area in the target
-    w            = y_true[:, 2] - y_true[:, 0]
-    h            = y_true[:, 3] - y_true[:, 1]
-    valid_mask   = tf.cast((w > 0) & (h > 0), tf.float32)   # (N,)
+    w          = y_true[:, 2] - y_true[:, 0]
+    h          = y_true[:, 3] - y_true[:, 1]
+    valid_mask = tf.cast((w > 0) & (h > 0), tf.float32)       # (N,)
 
-    # ── per-sample GIoU ──
-    ix1   = tf.maximum(y_true[:, 0], y_pred[:, 0])
-    iy1   = tf.maximum(y_true[:, 1], y_pred[:, 1])
-    ix2   = tf.minimum(y_true[:, 2], y_pred[:, 2])
-    iy2   = tf.minimum(y_true[:, 3], y_pred[:, 3])
-    inter = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+    # per-sample GIoU
+    ix1    = tf.maximum(y_true[:, 0], y_pred[:, 0])
+    iy1    = tf.maximum(y_true[:, 1], y_pred[:, 1])
+    ix2    = tf.minimum(y_true[:, 2], y_pred[:, 2])
+    iy2    = tf.minimum(y_true[:, 3], y_pred[:, 3])
+    inter  = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
     area_t = (y_true[:, 2] - y_true[:, 0]) * (y_true[:, 3] - y_true[:, 1])
     area_p = (y_pred[:, 2] - y_pred[:, 0]) * (y_pred[:, 3] - y_pred[:, 1])
     union  = area_t + area_p - inter + 1e-7
@@ -114,24 +119,24 @@ def combined_box_loss(y_true, y_pred):
     ex2    = tf.maximum(y_true[:, 2], y_pred[:, 2])
     ey2    = tf.maximum(y_true[:, 3], y_pred[:, 3])
     enc    = (ex2 - ex1) * (ey2 - ey1) + 1e-7
-    giou_per_sample = 1.0 - (iou - (enc - union) / enc)     # (N,)
+    giou_per_sample = 1.0 - (iou - (enc - union) / enc)       # (N,)
 
-    # ── per-sample smooth-L1 ──
-    diff   = tf.abs(y_true - y_pred)                         # (N, 4)
-    sl1    = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
-    sl1_per_sample = tf.reduce_mean(sl1, axis=1)             # (N,)
+    # per-sample smooth-L1
+    diff           = tf.abs(y_true - y_pred)                   # (N, 4)
+    sl1            = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
+    sl1_per_sample = tf.reduce_mean(sl1, axis=1)               # (N,)
 
-    # apply mask per sample, then reduce
     per_sample = (giou_per_sample + 0.5 * sl1_per_sample) * valid_mask
-    n_valid    = tf.maximum(tf.reduce_sum(valid_mask), 1.0)  # avoid div-by-zero
+    per_sample = tf.maximum(per_sample, 0.0)  # clamp: prevents negative GIoU from corrupting loss and collapsing box head to [0,0,1,1]
+    n_valid    = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
     return tf.reduce_sum(per_sample) / n_valid
 
 
 LOSSES     = {"c_final": tf.keras.losses.BinaryCrossentropy(),
               "b_final": combined_box_loss}
-CUSTOM_BOX = {"giou_loss":          giou_loss,
-              "smooth_l1":          smooth_l1,
-              "combined_box_loss":  combined_box_loss}
+CUSTOM_BOX = {"giou_loss":         giou_loss,
+              "smooth_l1":         smooth_l1,
+              "combined_box_loss": combined_box_loss}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -197,15 +202,10 @@ def rs_objective(pos):
     except Exception:
         return 1e6
 
-    # FIX: variable renamed _rs_labels (was _rs_ann) to match load_data
-    # return order: (images, boxes, labels). Using the wrong variable
-    # name here would reference an undefined name if the GWO subset
-    # variables from another module were in scope.
     Xtr, Xval, btr, bval, ltr, lval = train_test_split(
         _rs_imgs, _rs_boxes, _rs_labels, test_size=0.2, random_state=42
     )
     tf.keras.backend.clear_session()
-
     model = build_model(dropout_cls=dropout, dropout_reg=dropout,
                         dense_scale=dense_scale)
     model.compile(
@@ -216,7 +216,7 @@ def rs_objective(pos):
     history = model.fit(
         Xtr, {"c_final": ltr, "b_final": btr},
         validation_data=(Xval, {"c_final": lval, "b_final": bval}),
-        epochs=5, batch_size=8, verbose=0,
+        epochs=5, batch_size=8, verbose=1,
     )
     val_loss = float(history.history.get("val_loss", [1e6])[-1])
     del model
@@ -247,8 +247,7 @@ else:
     with open(PATH_RS, "w") as f:
         json.dump({"lr": best_lr, "dropout": best_dropout,
                    "dense_scale": best_scale}, f, indent=2)
-    print(f"RS done → LR={best_lr:.4e}  "
-          f"dropout={best_dropout:.3f}  scale={best_scale:.3f}")
+    print(f"RS done → LR={best_lr:.4e}  dropout={best_dropout:.3f}  scale={best_scale:.3f}")
     print(f"Saved → {PATH_RS}")
 
 tf.keras.backend.clear_session()
@@ -273,11 +272,8 @@ else:
     model = build_model(dropout_cls=best_dropout, dropout_reg=best_dropout,
                         dense_scale=best_scale)
 
-# FIX: freeze classification branch layers explicitly.
-# loss_weight=0 stops the loss contribution but does NOT stop gradient
-# flow — the backbone still updates through the box branch gradients
-# and those propagate into the classification head weights.
-# layer.trainable=False is the only way to truly isolate a branch.
+# Freeze classification head — box branch trains alone.
+# loss_weight=0 does NOT stop gradients; trainable=False does.
 for layer in model.layers:
     if layer.name.startswith("c_"):
         layer.trainable = False
@@ -309,8 +305,6 @@ X_train, X_val, box_train, box_val, label_train, label_val = train_test_split(
     *load_data(with_neg=True, aug=False), test_size=0.2
 )
 
-# Always load Stage 1 weights on first run to preserve transfer learning.
-# On reruns, load the existing Stage 2 checkpoint to continue.
 if os.path.exists(PATH_CLS):
     print(f"  Loading existing Stage 2 weights: {PATH_CLS}")
     model = load_model(PATH_CLS, custom_objects=CUSTOM_BOX)
@@ -318,9 +312,16 @@ else:
     print(f"  Fine-tuning from Stage 1: {PATH_BOX}")
     model = load_model(PATH_BOX, custom_objects=CUSTOM_BOX)
 
-# FIX: freeze box branch and backbone; only classification head trains.
+# FIX: freeze box branch AND backbone so only the classification
+# head (c_gap, c_dense1, c_dropout1, c_dense2, c_final) trains.
+# Original used "densenet121" — wrong backbone name for this combination.
+# The backbone here is wrapped as "MobileNetV3Small_MultiScale".
+# Freezing it prevents the catastrophic overfitting seen in training
+# (98% train accuracy, 50% val accuracy on last epoch).
 for layer in model.layers:
-    if layer.name.startswith("b_") or layer.name == "densenet121":
+    if layer.name.startswith("b_") \
+            or layer.name.startswith("ssd_") \
+            or layer.name == BACKBONE_LAYER_NAME:
         layer.trainable = False
     else:
         layer.trainable = True
@@ -340,7 +341,6 @@ model.fit(
     verbose=1,
 )
 print(f"Stage 2 complete → {PATH_CLS}")
-
 
 # =====================================================
 # STAGE 3 — SEGMENTATION  (U-Net, bleeding only)
@@ -377,7 +377,6 @@ model.fit(
 )
 print(f"Stage 3 complete → {PATH_SEG}")
 
-
 # =====================================================
 # STAGE 4 — COMBINED ColonNet
 # =====================================================
@@ -396,10 +395,6 @@ else:
             layer.trainable = False
 
     inp = Input(shape=(224, 224, 3), name="combined_input")
-
-    # FIX: upper(inp) returns [c_final, b_final] — unpack explicitly
-    # instead of splatting into a flat list, which loses output names.
-    # Named outputs make the combined model compilable and inspectable.
     cls_out, box_out = upper(inp)
     seg_out          = lower(inp)
 

@@ -48,7 +48,7 @@ def build_model(dropout_cls=0.3,
     x = Dropout(dropout_cls, name="c_dropout1")(x)
     x = Dense(int(64 * dense_scale), activation="relu", name="c_dense2")(x)
 
-    c_out = Dense(1, activation="sigmoid", name="c_final")(x)
+    c_out = Dense(1, activation="sigmoid", dtype="float32", name="c_final")(x)
 
     # =================================================
     # Bounding Box Branch: SSD Lite Style
@@ -138,6 +138,7 @@ def Build_Unet_Model(num_filters=32, input_shape=(224, 224, 3)):
     outputs = Conv2D(1, 1,
                      padding="same",
                      activation="sigmoid",
+                     dtype="float32",
                      name="seg_output")(d3)
 
     model = Model(inputs, outputs, name="ShallowUNet_3L")

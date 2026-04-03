@@ -8,6 +8,7 @@ model_comb3/YoloDataset/
 model_comb3/HyperbandLogs/
 model_comb2/EvalOutputs/
 model_comb1/EvalOutputs/
+model_comb3/EvalOutputs/
 
 .venv/
 __pycache__/

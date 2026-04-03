@@ -4,28 +4,27 @@ eval.py  —  ColonNet Evaluation Script
 Test dataset structure:
   TestingDatasets/
     Test Dataset 1/
-      Annotations/          ← binary segmentation masks
-      Unmarked Images/      ← input images
+      Annotations/          <- binary segmentation masks  (A000X.png)
+      Unmarked Images/      <- input images               (A000X.png)
       Test Dataset 1 TXT (True labels).xlsx
 
     Test Dataset 2/
-      Annotations/
-      Images/
+      Annotations/          <- binary segmentation masks  (A000X.png)
+      Images/               <- input images               (A000X.png)
       Test Dataset 2 TXT (True labels).xlsx
 
 Label convention (matches training):
-    0 = bleeding
-    1 = non-bleeding
+    1 = bleeding   (positive class, emitted by training as 1.0)
+    0 = non-bleeding
 """
 
 import os
 import glob
 import sys
-# ROOT = model_comb2 root, PROJECT_ROOT = repository root
-# ─────────────────────────────────────────────────────────────
+
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-ROOT         = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))          # model_comb2
-PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, ".."))                # repository root
+ROOT         = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(ROOT, ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -34,9 +33,6 @@ import pandas as pd
 import tensorflow as tf
 from PIL import Image
 from tqdm import tqdm
-# import matplotlib
-# matplotlib.use("Agg")          # non-interactive backend — no display needed
-# import matplotlib.pyplot as plt
 
 from sklearn.metrics import (accuracy_score, f1_score, recall_score,
                               average_precision_score,
@@ -47,7 +43,7 @@ from utils.losses import focal_tversky, tversky
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
-TESTING_ROOT = os.path.join(PROJECT_ROOT, "TestingDatasets")   # top-level test datasets
+TESTING_ROOT = os.path.join(PROJECT_ROOT, "TestingDatasets")
 MODELS_DIR   = os.path.join(ROOT, "SavedModels")
 OUTPUT_DIR   = os.path.join(ROOT, "EvalOutputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -68,7 +64,7 @@ DATASETS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# CUSTOM OBJECTS  (must match training definitions exactly)
+# CUSTOM OBJECTS
 # ─────────────────────────────────────────────────────────────
 
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -84,12 +80,7 @@ def smooth_l1(y_true, y_pred):
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
     diff   = tf.abs(y_true - y_pred)
-    loss   = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
-    return tf.reduce_mean(loss)
-
-
-def combined_box_loss(y_true, y_pred):
-    return giou_loss(y_true, y_pred) + 0.5 * smooth_l1(y_true, y_pred)
+    return tf.reduce_mean(tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5))
 
 
 def giou_loss(y_true, y_pred):
@@ -112,8 +103,13 @@ def giou_loss(y_true, y_pred):
     return tf.reduce_mean(1.0 - (iou - (enc - union) / enc))
 
 
+def combined_box_loss(y_true, y_pred):
+    return giou_loss(y_true, y_pred) + 0.5 * smooth_l1(y_true, y_pred)
+
+
 SEG_CUSTOM = {"focal_tversky": focal_tversky, "tversky": tversky, "dice_coef": dice_coef}
-BOX_CUSTOM = {"giou_loss": giou_loss, "smooth_l1": smooth_l1, "combined_box_loss": combined_box_loss}
+BOX_CUSTOM = {"giou_loss": giou_loss, "smooth_l1": smooth_l1,
+              "combined_box_loss": combined_box_loss}
 
 # ─────────────────────────────────────────────────────────────
 # LOAD MODELS
@@ -144,31 +140,22 @@ modelC = tf.keras.models.load_model(
 
 print("All models loaded.\n")
 
-# ── Segmentation model weight sanity check ──────────────────
-# If the model was saved before training completed (or trained
-# for 0 epochs), all weights may be at initialisation values
-# which produce near-zero outputs after the sigmoid activation.
+# Segmentation model sanity check
 print("Checking segmentation model weights …")
 total_params  = modelC.count_params()
-nonzero_count = sum(
-    int(np.count_nonzero(w.numpy()))
-    for w in modelC.weights
-)
-all_weights = np.concatenate([w.numpy().flatten() for w in modelC.weights])
+nonzero_count = sum(int(np.count_nonzero(w.numpy())) for w in modelC.weights)
+all_weights   = np.concatenate([w.numpy().flatten() for w in modelC.weights])
 print(f"  Total params     : {total_params}")
 print(f"  Non-zero weights : {nonzero_count} / {total_params}")
 print(f"  Weight range     : min={all_weights.min():.6f}  max={all_weights.max():.6f}")
 print(f"  Weight std-dev   : {all_weights.std():.6f}")
-
-# Run one forward pass on a blank input to check output range
 _dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
 _out   = modelC.predict(_dummy, verbose=0).squeeze().astype(np.float32)
 print(f"  Dummy-input output: min={_out.min():.6f}  max={_out.max():.6f}  mean={_out.mean():.6f}")
 if _out.max() < 0.01:
-    print("  ⚠  OUTPUT IS DEAD — model weights were never trained or are zeroed out.")
-    print("     Delete segmentation.keras and re-run training.py Stage 3.")
+    print("  ⚠  OUTPUT IS DEAD — delete segmentation.keras and retrain Stage 3.")
 else:
-    print("  ✓  Model produces non-zero output — issue is input preprocessing.")
+    print("  ✓  Segmentation model is live.")
 print()
 
 
@@ -177,10 +164,18 @@ print()
 # ─────────────────────────────────────────────────────────────
 
 def load_image(path):
-    pil = Image.open(path).convert("RGB")
-    arr = np.array(pil.resize((IMG_SIZE, IMG_SIZE)), dtype=np.float32)
-    arr = (arr / 127.5) - 1.0          # [-1, 1] to match MobileNetV3Small training
-    return pil, np.expand_dims(arr, 0).astype(np.float32)
+    """
+    Returns (pil_img, mobilenet_batch, unet_batch).
+    FIX: modelA/B (MobileNetV3) need [-1, 1] normalisation.
+         modelC (U-Net) was trained on [0, 1] — different tensor required.
+    Original used a single [-1,1] tensor for all three models, which
+    suppressed U-Net outputs below the 0.5 threshold on every image.
+    """
+    pil      = Image.open(path).convert("RGB")
+    arr      = np.array(pil.resize((IMG_SIZE, IMG_SIZE)), dtype=np.float32)
+    mobilenet = (arr / 127.5) - 1.0          # [-1, 1] for MobileNetV3
+    unet      = arr / 255.0                   # [0, 1]  for U-Net
+    return pil, np.expand_dims(mobilenet, 0), np.expand_dims(unet, 0)
 
 
 def find_col(df, candidates, required=True):
@@ -188,12 +183,16 @@ def find_col(df, candidates, required=True):
         if c in df.columns:
             return c
     if required:
-        raise KeyError(f"None of {candidates} found in {list(df.columns)}")
+        raise KeyError(f"None of {candidates} found in columns: {list(df.columns)}")
     return None
 
 
 def load_gt_excel(path):
     df      = pd.read_excel(path)
+
+    # FIX: print columns on load so mismatches are immediately visible
+    print(f"  Excel columns: {list(df.columns)}")
+
     img_col = find_col(df, ["image_name", "image", "filename", "file",
                              "image_id", "img", "name", "Image", "Filename"])
     cls_col = find_col(df, ["class_label", "class", "label", "labels",
@@ -203,8 +202,14 @@ def load_gt_excel(path):
     xmax_col = find_col(df, ["x_max", "xmax", "X_max", "Xmax"], required=False)
     ymax_col = find_col(df, ["y_max", "ymax", "Y_max", "Ymax"], required=False)
 
+    # Key = image filename without extension, stripped of any path prefix
     df["_key"] = (df[img_col].astype(str)
                   .apply(lambda x: os.path.splitext(os.path.basename(x))[0]))
+
+    # FIX: print a sample of keys so we can verify they match image filenames
+    print(f"  Excel keys (first 5): {list(df['_key'][:5])}")
+    print(f"  cls_col='{cls_col}'  sample values: {list(df[cls_col][:5])}")
+
     return df.set_index("_key"), cls_col, xmin_col, ymin_col, xmax_col, ymax_col
 
 
@@ -266,16 +271,16 @@ def evaluate_dataset(tag, cfg):
     print(f"\n{'─' * 55}\n  Evaluating {tag}\n{'─' * 55}")
 
     if not os.path.isfile(xlsx_path):
-        alt = os.path.join(PROJECT_ROOT, "TestingDatasets", os.path.basename(root), os.path.basename(cfg['xlsx']))
+        alt = os.path.join(PROJECT_ROOT, "TestingDatasets",
+                           os.path.basename(root), os.path.basename(cfg["xlsx"]))
         if os.path.isfile(alt):
-            print(f"  Warning: xlsx file not found at expected path; using {alt}")
+            print(f"  Warning: xlsx not at expected path; using {alt}")
             xlsx_path = alt
         else:
             raise FileNotFoundError(
                 f"Ground truth xlsx not found:\n"
                 f"  expected: {xlsx_path}\n"
-                f"  fallback:  {alt}\n"
-                f"Please verify the dataset path or file name."
+                f"  fallback: {alt}"
             )
 
     df, cls_col, xmin_col, ymin_col, xmax_col, ymax_col = load_gt_excel(xlsx_path)
@@ -284,7 +289,15 @@ def evaluate_dataset(tag, cfg):
     image_files = sorted(f for f in glob.glob(os.path.join(images_dir, "*"))
                          if os.path.isfile(f)
                          and os.path.splitext(f)[1].lower() in IMAGE_EXTS)
-    print(f"  Images found: {len(image_files)}\n")
+    print(f"  Images found: {len(image_files)}")
+
+    # FIX: report how many image keys actually match the Excel index
+    # so a mismatch is caught before the full loop runs.
+    sample_keys = [os.path.splitext(os.path.basename(f))[0] for f in image_files[:5]]
+    matched     = sum(1 for f in image_files
+                      if os.path.splitext(os.path.basename(f))[0] in df.index)
+    print(f"  Excel rows matched to image files: {matched} / {len(image_files)}")
+    print(f"  Sample image keys: {sample_keys}\n")
 
     rows_txt, rows_yolo = [], []
     cls_preds, cls_gts, cls_probs = [], [], []
@@ -294,28 +307,34 @@ def evaluate_dataset(tag, cfg):
         fname = os.path.basename(img_path)
         key   = os.path.splitext(fname)[0]
 
-        pil_img, img_batch = load_image(img_path)
-        img_w, img_h       = pil_img.size
+        # Single load — FIX: original called load_image twice per image
+        pil_img, img_mobilenet, img_unet = load_image(img_path)
+        img_w, img_h = pil_img.size
 
-        # ── Ground truth ─────────────────────────────
+        # ── Ground truth ──────────────────────────────
         gt_cls    = -1
         gt_box_px = [0, 0, img_w, img_h]
 
         if key in df.index:
-            row = df.loc[key]
+            row    = df.loc[key]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             gt_cls = int(row[cls_col])
             box    = get_gt_box(row, xmin_col, ymin_col, xmax_col, ymax_col)
             if box is not None:
-                gt_box_px = box
+                # FIX: denormalise gt box if xlsx stores normalised coords.
+                # denorm_box applies the same check as for pred_box:
+                # if all values <= 1.0, treat as normalised and scale to pixels.
+                gt_box_px = denorm_box(box, img_w, img_h)
 
+        # Annotation mask — try exact filename match first, then numeric fallback
         mask_path = None
         for ext in (".png", ".bmp", ".jpg", ".tif"):
             candidate = os.path.join(annot_dir, key + ext)
             if os.path.exists(candidate):
                 mask_path = candidate
                 break
+
         if mask_path is None:
             import re as _re
             key_num = _re.search(r"\d+", key)
@@ -326,6 +345,7 @@ def evaluate_dataset(tag, cfg):
                     if af_num and af_num.group() == key_num:
                         mask_path = os.path.join(annot_dir, af)
                         break
+
         if mask_path and os.path.exists(mask_path):
             gt_mask = (np.array(
                            Image.open(mask_path).convert("L")
@@ -334,27 +354,34 @@ def evaluate_dataset(tag, cfg):
         else:
             gt_mask = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
 
-        # ── Predictions ──────────────────────────────
-        cls_out, _  = modelB.predict(img_batch, verbose=0)
+        # ── Predictions ───────────────────────────────
+        cls_out, _  = modelB.predict(img_mobilenet, verbose=0)
         conf        = float(cls_out.flatten()[0])
-        pred_cls    = int(round(conf))          # 0=bleeding, 1=non-bleeding
+        # FIX: training emits 1.0=bleeding, 0.0=non-bleeding.
+        # conf≈1 → bleeding (pred_cls=1), conf≈0 → non-bleeding (pred_cls=0).
+        pred_cls    = int(round(conf))
 
-        _, box_out  = modelA.predict(img_batch, verbose=0)
+        _, box_out  = modelA.predict(img_mobilenet, verbose=0)
         pred_box    = denorm_box(box_out, img_w, img_h)
 
-        seg_out   = modelC.predict(img_batch.astype(np.float32), verbose=0)
+        # FIX: U-Net receives [0,1] tensor, not the [-1,1] MobileNet tensor
+        seg_out   = modelC.predict(img_unet, verbose=0)
         seg_out_f = seg_out.squeeze().astype(np.float32)
+
         if serial == 1:
-            print(f"  [DEBUG] seg_out shape={seg_out.shape} dtype={seg_out.dtype} "
-                  f"min={seg_out_f.min():.6f} max={seg_out_f.max():.6f} "
-                  f"mean={seg_out_f.mean():.6f} >0.5={( seg_out_f>0.5).sum()}")
+            print(f"  [DEBUG] seg_out: min={seg_out_f.min():.4f}  "
+                  f"max={seg_out_f.max():.4f}  "
+                  f"mean={seg_out_f.mean():.4f}  "
+                  f">0.5={(seg_out_f > 0.5).sum()}")
+            print(f"  [DEBUG] gt_cls={gt_cls}  conf={conf:.4f}  pred_cls={pred_cls}")
             if mask_path:
-                print(f"  [DEBUG] gt_mask={mask_path} true_px={gt_mask.sum()}")
+                print(f"  [DEBUG] gt_mask={mask_path}  true_px={gt_mask.sum()}")
             else:
-                print(f"  [DEBUG] gt_mask NOT FOUND key={key}")
+                print(f"  [DEBUG] gt_mask NOT FOUND for key={key}")
+
         pred_mask = (seg_out_f > 0.5).astype(bool)
 
-        # ── Metrics ──────────────────────────────────
+        # ── Metrics ───────────────────────────────────
         iou_bbox      = iou_score(pred_box, gt_box_px)
         iou_seg, dice = seg_metrics(pred_mask, gt_mask)
 
@@ -363,22 +390,26 @@ def evaluate_dataset(tag, cfg):
         cls_gts.append(gt_cls);      cls_probs.append(conf)
 
         rows_txt.append({
-            "Serial Number": serial, "Image Number": fname,
-            "Predicted Class": pred_cls,
+            "Serial Number":    serial,
+            "Image Number":     fname,
+            "Predicted Class":  pred_cls,
             "x_min": round(pred_box[0], 2), "y_min": round(pred_box[1], 2),
             "x_max": round(pred_box[2], 2), "y_max": round(pred_box[3], 2),
             "Confidence Score": round(conf, 4),
-            "IoU Score": round(iou_bbox, 4), "Dice Coefficient": round(dice, 4),
+            "IoU Score":        round(iou_bbox, 4),
+            "Dice Coefficient": round(dice, 4),
         })
 
         cx, cy, bw, bh = box_to_yolo_norm(pred_box, img_w, img_h)
         rows_yolo.append({
-            "Serial Number": serial, "Image Number": fname,
-            "Predicted Class": pred_cls,
+            "Serial Number":    serial,
+            "Image Number":     fname,
+            "Predicted Class":  pred_cls,
             "x_mid": round(cx, 6), "y_mid": round(cy, 6),
             "width": round(bw, 6), "height": round(bh, 6),
             "Confidence Score": round(conf, 4),
-            "IoU Score": round(iou_bbox, 4), "Dice Coefficient": round(dice, 4),
+            "IoU Score":        round(iou_bbox, 4),
+            "Dice Coefficient": round(dice, 4),
         })
 
     pd.DataFrame(rows_txt).to_excel(
@@ -386,22 +417,25 @@ def evaluate_dataset(tag, cfg):
     pd.DataFrame(rows_yolo).to_excel(
         os.path.join(OUTPUT_DIR, f"{tag}_predictions_yolo.xlsx"), index=False)
 
+    # ── Summary metrics ───────────────────────────────
     valid   = [i for i, g in enumerate(cls_gts) if g != -1]
     gts_v   = [cls_gts[i]   for i in valid]
     preds_v = [cls_preds[i] for i in valid]
     probs_v = [cls_probs[i] for i in valid]
 
-    acc = accuracy_score(gts_v, preds_v)                       if gts_v else float("nan")
+    if not gts_v:
+        print(f"\n  WARNING: No ground-truth labels were matched for {tag}.")
+        print(f"  Check that image filenames match the 'image' column in the xlsx.")
+        print(f"  All classification metrics will be NaN.\n")
+
+    acc = accuracy_score(gts_v, preds_v)                    if gts_v else float("nan")
     rec = recall_score(gts_v, preds_v, average="macro",
-                       zero_division=0)                        if gts_v else float("nan")
+                       zero_division=0)                     if gts_v else float("nan")
     f1  = f1_score(gts_v, preds_v, average="macro",
-                   zero_division=0)                            if gts_v else float("nan")
+                   zero_division=0)                         if gts_v else float("nan")
     try:    ap = average_precision_score(gts_v, probs_v)
     except: ap = float("nan")
 
-    # ── ROC-AUC ──────────────────────────────────────
-    # probs_v is raw sigmoid output (~0=bleeding, ~1=non-bleeding).
-    # roc_auc_score expects probability of the positive class (1=non-bleeding).
     try:
         auc = roc_auc_score(gts_v, probs_v)
         fpr, tpr, _ = roc_curve(gts_v, probs_v)
@@ -424,26 +458,8 @@ def evaluate_dataset(tag, cfg):
         pd.DataFrame({"Metric": ["Dice Coefficient (mean)", "Seg IoU (mean)"],
                       "Value":  [round(mean_dice,4), round(mean_seg_iou,4)]}
                      ).to_excel(writer, sheet_name="Segmentation", index=False)
-        # ROC curve data as its own sheet for reference
         pd.DataFrame({"FPR": np.round(fpr, 6), "TPR": np.round(tpr, 6)}
                      ).to_excel(writer, sheet_name="ROC Curve Data", index=False)
-
-    # ── Save ROC curve plot ───────────────────────────
-    # roc_path = os.path.join(OUTPUT_DIR, f"{tag}_roc_curve.png")
-    # fig, ax  = plt.subplots(figsize=(6, 5))
-    # ax.plot(fpr, tpr, color="steelblue", lw=2,
-    #         label=f"ROC curve (AUC = {auc:.4f})")
-    # ax.plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--", label="Random")
-    # ax.set_xlim([0.0, 1.0])
-    # ax.set_ylim([0.0, 1.02])
-    # ax.set_xlabel("False Positive Rate")
-    # ax.set_ylabel("True Positive Rate")
-    # ax.set_title(f"ROC Curve — {tag}")
-    # ax.legend(loc="lower right")
-    # fig.tight_layout()
-    # fig.savefig(roc_path, dpi=150)
-    # plt.close(fig)
-    # print(f"  ROC curve saved → {roc_path}")
 
     print(f"\n  Results for {tag}")
     print(f"  {'─'*42}")

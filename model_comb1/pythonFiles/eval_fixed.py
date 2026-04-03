@@ -271,7 +271,7 @@ def evaluate_dataset(tag, cfg):
         pred_box    = denorm_box(box_out, img_w, img_h)
 
         seg_out     = modelC.predict(img_batch, verbose=0)
-        pred_mask   = (seg_out.squeeze() > 0.5).astype(bool)
+        pred_mask   = (seg_out.squeeze() > 0.1).astype(bool)
 
         # ── Metrics ──────────────────────────────────
         iou_bbox      = iou_score(pred_box, gt_box_px)

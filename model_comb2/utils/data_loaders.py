@@ -6,6 +6,9 @@ import xml.etree.ElementTree as ET
 IMG_SIZE = 224
 
 # Label convention
+# LABEL_BLEED=0, LABEL_NONBLEED=1 as constants, but the arithmetic
+# 1.0 - float(LABEL_BLEED) = 1.0  and  1.0 - float(LABEL_NONBLEED) = 0.0
+# means labels emitted are: bleeding→1.0, non-bleeding→0.0 (correct).
 LABEL_BLEED    = 0
 LABEL_NONBLEED = 1
 
@@ -75,18 +78,22 @@ def biggest_box(boxes):
 # =====================================================
 
 def load_data(with_neg=True, aug=False, nums=1, data_root=None):
+    """
+    Returns (images, boxes, labels).
+    labels: 1.0 = bleeding, 0.0 = non-bleeding.
+    XML files share the same prefix as images: img- (N).xml — correct.
+    """
     if data_root is None:
         data_root = _DEFAULT_DATA
 
     bleeding_path     = os.path.join(data_root, "bleeding")
     non_bleeding_path = os.path.join(data_root, "non-bleeding")
 
-    xml_dir = os.path.join(bleeding_path, "Bounding boxes", "XML")
-    img_dir = os.path.join(bleeding_path, "Images")
-
+    xml_dir  = os.path.join(bleeding_path, "Bounding boxes", "XML")
+    img_dir  = os.path.join(bleeding_path, "Images")
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
-    images, boxes, labels, valid_mask = [], [], [], []
+    images, boxes, labels = [], [], []
 
     # ── BLEEDING ──
     for fname in sorted(os.listdir(img_dir)):
@@ -100,17 +107,13 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
-        stem = os.path.splitext(fname)[0]
+        stem = os.path.splitext(fname)[0]                    # "img- (N)"
         xml_boxes, _ = read_xml(os.path.join(xml_dir, stem + ".xml"))
-        found, box   = biggest_box(xml_boxes)
+        _, box = biggest_box(xml_boxes)
 
         images.append(img)
         boxes.append(box)
-        # bleeding samples
-        labels.append(1.0 - float(LABEL_BLEED))    # 0 → 1
-
-
-        valid_mask.append(1.0)  # valid bbox
+        labels.append(1.0 - float(LABEL_BLEED))             # 0 → 1.0  (bleeding)
 
     # ── NON-BLEEDING ──
     if with_neg:
@@ -128,16 +131,13 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
             images.append(img)
-            boxes.append([0.0, 0.0, 0.0, 0.0])  # dummy
-            # non-bleeding samples  
-            labels.append(1.0 - float(LABEL_NONBLEED)) # 1 → 0  
-            valid_mask.append(0.0)  # IMPORTANT
+            boxes.append([0.0, 0.0, 0.0, 0.0])
+            labels.append(1.0 - float(LABEL_NONBLEED))      # 1 → 0.0  (non-bleeding)
 
     return (
         np.array(images, dtype=np.float32),
         np.array(boxes,  dtype=np.float32),
         np.array(labels, dtype=np.float32),
-        # np.array(valid_mask, dtype=np.float32),  # NEW
     )
 
 
@@ -146,6 +146,12 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
 # =====================================================
 
 def load_data_unet(aug=False, nums=1, data_root=None, include_neg=False):
+    """
+    Returns (images, masks) for bleeding frames only by default.
+    FIX: annotation files are named "ann- (N).png", NOT "img- (N).png".
+    The stem of the image file ("img- (N)") must have its prefix
+    swapped to "ann-" before looking up the mask file.
+    """
     if data_root is None:
         data_root = _DEFAULT_DATA
 
@@ -154,7 +160,6 @@ def load_data_unet(aug=False, nums=1, data_root=None, include_neg=False):
 
     img_dir  = os.path.join(bleeding_path, "Images")
     mask_dir = os.path.join(bleeding_path, "Annotations")
-
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
     images, masks = [], []
@@ -171,11 +176,13 @@ def load_data_unet(aug=False, nums=1, data_root=None, include_neg=False):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
-        stem      = os.path.splitext(fname)[0]
-        mask_path = os.path.join(mask_dir, stem + ".png")
+        # "img- (N).png" → stem "img- (N)" → ann_stem "ann- (N)"
+        stem     = os.path.splitext(fname)[0]           # "img- (N)"
+        ann_stem = "ann-" + stem.split("-", 1)[1]       # "ann- (N)"
 
+        mask_path = os.path.join(mask_dir, ann_stem + ".png")
         if not os.path.exists(mask_path):
-            mask_path = os.path.join(mask_dir, stem + ".bmp")
+            mask_path = os.path.join(mask_dir, ann_stem + ".bmp")
 
         if os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -189,6 +196,8 @@ def load_data_unet(aug=False, nums=1, data_root=None, include_neg=False):
         masks.append(mask)
 
     # ── OPTIONAL NON-BLEEDING ──
+    # include_neg defaults to False. All-zero masks for non-bleeding frames
+    # teach the U-Net to predict nothing — always leave this False.
     if include_neg:
         nb_img_dir = os.path.join(non_bleeding_path, "images")
 
