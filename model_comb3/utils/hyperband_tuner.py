@@ -2,28 +2,26 @@
 hyperband_tuner.py  —  Combination 3
 Hyperband hyperparameter tuning via keras-tuner.
 
-Replaces random_search.py from Combination 2.
+FIX: Internal combined_box_loss replaced with smooth-L1 only.
+     GIoU produces values in [-1, 2] making the total loss negative.
+     With objective="val_loss", Hyperband treats the most-collapsed
+     model (predicting [0,0,1,1]) as the best trial — same problem
+     as in Combination 2's Random Search. Smooth-L1 is always >= 0.
 
 Why Hyperband over Random Search?
-  - Hyperband adaptively allocates compute: bad configs are killed early,
-    good configs get more epochs automatically.
-  - Far more efficient than grid/random search at the same compute budget.
-  - keras-tuner integrates natively with Keras models.
+  - Adaptively allocates compute: bad configs are killed early.
+  - Good configs get more epochs automatically.
+  - More efficient than grid/random at the same compute budget.
 
-Install:
-    pip install keras-tuner
-
-Search space (3 dims, same as Combo 2 for comparability):
-  learning_rate : log-uniform in [1e-5, 1e-3]
+Search space (3 dims):
+  learning_rate : log-uniform in [1e-5, 3e-4]   (upper bound lowered from 1e-3
+                                                   to prevent LR that collapses
+                                                   the box head in 2 epochs)
   dropout       : uniform in {0.1, 0.2, 0.3, 0.4, 0.5}
   dense_units   : choice in {64, 128, 256}
 
-Usage (called from training.py):
-    from utils.hyperband_tuner import run_hyperband
-    best_hp = run_hyperband(X_rs, ann_rs, box_rs, tuner_dir)
-    best_lr      = best_hp["learning_rate"]
-    best_dropout = best_hp["dropout"]
-    best_units   = best_hp["dense_units"]
+Install:
+    pip install keras-tuner
 """
 
 import os
@@ -39,50 +37,33 @@ except ImportError:
     _KT_AVAILABLE = False
 
 
-# ── lazy import to avoid circular dependency ──────────────────────────
 def _get_build_model():
     from utils.base_models import build_model
     return build_model
 
 
-def _get_losses():
-    """Returns the LOSSES dict used for the box-only objective."""
-    import sys, os
-    # losses are defined in training.py; we redefine them here to keep
-    # hyperband_tuner.py self-contained.
-    import tensorflow as tf
-
-    def giou_loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        ix1  = tf.maximum(y_true[:, 0], y_pred[:, 0])
-        iy1  = tf.maximum(y_true[:, 1], y_pred[:, 1])
-        ix2  = tf.minimum(y_true[:, 2], y_pred[:, 2])
-        iy2  = tf.minimum(y_true[:, 3], y_pred[:, 3])
-        inter = tf.maximum(ix2-ix1, 0) * tf.maximum(iy2-iy1, 0)
-        at = (y_true[:,2]-y_true[:,0]) * (y_true[:,3]-y_true[:,1])
-        ap = (y_pred[:,2]-y_pred[:,0]) * (y_pred[:,3]-y_pred[:,1])
-        union = at + ap - inter + 1e-7
-        iou = inter / union
-        ex1 = tf.minimum(y_true[:,0], y_pred[:,0])
-        ey1 = tf.minimum(y_true[:,1], y_pred[:,1])
-        ex2 = tf.maximum(y_true[:,2], y_pred[:,2])
-        ey2 = tf.maximum(y_true[:,3], y_pred[:,3])
-        enc = (ex2-ex1)*(ey2-ey1) + 1e-7
-        return tf.reduce_mean(1.0 - (iou - (enc-union)/enc))
-
-    def smooth_l1(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        diff = tf.abs(y_true - y_pred)
-        return tf.reduce_mean(tf.where(diff < 1.0, 0.5*diff**2, diff-0.5))
-
+def _make_smooth_l1_loss():
+    """
+    Returns smooth-L1 box loss masked to valid (non-zero area) boxes.
+    Always >= 0 — safe for Hyperband's val_loss minimisation objective.
+    GIoU has been removed: it produces negative losses, causing Hyperband
+    to select the most-collapsed model as the best trial.
+    """
     def combined_box_loss(y_true, y_pred):
-        w = y_true[:,2] - y_true[:,0]
-        h = y_true[:,3] - y_true[:,1]
-        mask = tf.cast((w > 0) & (h > 0), tf.float32)
-        loss = giou_loss(y_true, y_pred) + 0.5 * smooth_l1(y_true, y_pred)
-        return tf.reduce_mean(loss * mask)
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
+        w          = y_true[:, 2] - y_true[:, 0]
+        h          = y_true[:, 3] - y_true[:, 1]
+        valid_mask = tf.cast((w > 0) & (h > 0), tf.float32)
+
+        diff           = tf.abs(y_true - y_pred)
+        sl1            = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
+        sl1_per_sample = tf.reduce_mean(sl1, axis=1)
+
+        masked  = sl1_per_sample * valid_mask
+        n_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+        return tf.reduce_sum(masked) / n_valid
 
     return {
         "c_final": tf.keras.losses.BinaryCrossentropy(),
@@ -91,7 +72,7 @@ def _get_losses():
 
 
 # =====================================================
-# HyperModel — wraps build_model for keras-tuner
+# HyperModel
 # =====================================================
 
 class ColonHyperModel(kt.HyperModel):
@@ -99,7 +80,7 @@ class ColonHyperModel(kt.HyperModel):
     Defines the search space and how to build + compile each trial model.
     Tunes: learning_rate, dropout, dense_units.
     Uses box-only loss (c_final weight=0) so the search focuses on
-    regression quality — same strategy as Combo 2's random search.
+    regression quality.
     """
 
     def __init__(self, losses):
@@ -109,7 +90,7 @@ class ColonHyperModel(kt.HyperModel):
     def build(self, hp):
         build_model = _get_build_model()
 
-        lr          = hp.Float("learning_rate", 1e-5, 1e-3, sampling="log")
+        lr          = hp.Float("learning_rate", 1e-5, 3e-4, sampling="log")
         dropout     = hp.Float("dropout", 0.1, 0.5, step=0.1)
         dense_units = hp.Choice("dense_units", [64, 128, 256])
 
@@ -142,12 +123,6 @@ def run_hyperband(X, ann, boxes, tuner_dir,
     """
     Run Hyperband search and return the best hyperparameters as a dict.
 
-    Hyperband settings for low-compute budget:
-      max_epochs = 10   — maximum epochs any single trial can run
-      factor     = 3    — halving/tripling factor (standard default)
-      → roughly equivalent to ~6 random-search trials at 3 epochs each,
-        but Hyperband promotes the best trials automatically.
-
     Parameters
     ----------
     X        : np.ndarray  (N, 224, 224, 3)  images
@@ -176,8 +151,8 @@ def run_hyperband(X, ann, boxes, tuner_dir,
         X, boxes, ann, test_size=val_split, random_state=seed
     )
 
-    losses      = _get_losses()
-    hypermodel  = ColonHyperModel(losses)
+    losses     = _make_smooth_l1_loss()
+    hypermodel = ColonHyperModel(losses)
 
     tuner = kt.Hyperband(
         hypermodel,
@@ -223,7 +198,6 @@ def run_hyperband(X, ann, boxes, tuner_dir,
     for k, v in result.items():
         print(f"  {k}: {v}")
 
-    # free memory
     tf.keras.backend.clear_session()
     gc.collect()
 
