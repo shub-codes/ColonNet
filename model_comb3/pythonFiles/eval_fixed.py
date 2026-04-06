@@ -127,17 +127,28 @@ def giou_loss(y_true, y_pred):
 
 
 def combined_box_loss(y_true, y_pred):
+    """IoU loss + 0.5 * smooth-L1, masked to valid boxes. Matches training.py."""
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
     w = y_true[:, 2] - y_true[:, 0]
     h = y_true[:, 3] - y_true[:, 1]
     valid_mask = tf.cast((w > 0) & (h > 0), tf.float32)
+    ix1   = tf.maximum(y_true[:, 0], y_pred[:, 0])
+    iy1   = tf.maximum(y_true[:, 1], y_pred[:, 1])
+    ix2   = tf.minimum(y_true[:, 2], y_pred[:, 2])
+    iy2   = tf.minimum(y_true[:, 3], y_pred[:, 3])
+    inter = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+    area_t = (y_true[:, 2] - y_true[:, 0]) * (y_true[:, 3] - y_true[:, 1])
+    area_p = (y_pred[:, 2] - y_pred[:, 0]) * (y_pred[:, 3] - y_pred[:, 1])
+    union  = area_t + area_p - inter + 1e-7
+    iou    = tf.clip_by_value(inter / union, 0.0, 1.0)
+    iou_loss_per_sample = 1.0 - iou
     diff           = tf.abs(y_true - y_pred)
     sl1            = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
     sl1_per_sample = tf.reduce_mean(sl1, axis=1)
-    masked  = sl1_per_sample * valid_mask
-    n_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-    return tf.reduce_sum(masked) / n_valid
+    per_sample = (iou_loss_per_sample + 0.5 * sl1_per_sample) * valid_mask
+    n_valid    = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+    return tf.reduce_sum(per_sample) / n_valid
 
 
 SEG_CUSTOM = {"focal_tversky": focal_tversky, "tversky": tversky, "dice_coef": dice_coef}

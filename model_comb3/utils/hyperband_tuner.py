@@ -42,7 +42,7 @@ def _get_build_model():
     return build_model
 
 
-def _make_smooth_l1_loss():
+def _make_box_loss():
     """
     Returns smooth-L1 box loss masked to valid (non-zero area) boxes.
     Always >= 0 — safe for Hyperband's val_loss minimisation objective.
@@ -52,18 +52,25 @@ def _make_smooth_l1_loss():
     def combined_box_loss(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
-
         w          = y_true[:, 2] - y_true[:, 0]
         h          = y_true[:, 3] - y_true[:, 1]
         valid_mask = tf.cast((w > 0) & (h > 0), tf.float32)
-
+        ix1   = tf.maximum(y_true[:, 0], y_pred[:, 0])
+        iy1   = tf.maximum(y_true[:, 1], y_pred[:, 1])
+        ix2   = tf.minimum(y_true[:, 2], y_pred[:, 2])
+        iy2   = tf.minimum(y_true[:, 3], y_pred[:, 3])
+        inter = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+        area_t = (y_true[:, 2] - y_true[:, 0]) * (y_true[:, 3] - y_true[:, 1])
+        area_p = (y_pred[:, 2] - y_pred[:, 0]) * (y_pred[:, 3] - y_pred[:, 1])
+        union  = area_t + area_p - inter + 1e-7
+        iou    = tf.clip_by_value(inter / union, 0.0, 1.0)
+        iou_loss_per_sample = 1.0 - iou
         diff           = tf.abs(y_true - y_pred)
         sl1            = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
         sl1_per_sample = tf.reduce_mean(sl1, axis=1)
-
-        masked  = sl1_per_sample * valid_mask
-        n_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-        return tf.reduce_sum(masked) / n_valid
+        per_sample = (iou_loss_per_sample + 0.5 * sl1_per_sample) * valid_mask
+        n_valid    = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+        return tf.reduce_sum(per_sample) / n_valid
 
     return {
         "c_final": tf.keras.losses.BinaryCrossentropy(),
@@ -151,7 +158,7 @@ def run_hyperband(X, ann, boxes, tuner_dir,
         X, boxes, ann, test_size=val_split, random_state=seed
     )
 
-    losses     = _make_smooth_l1_loss()
+    losses     = _make_box_loss()
     hypermodel = ColonHyperModel(losses)
 
     tuner = kt.Hyperband(
