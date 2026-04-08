@@ -194,45 +194,23 @@ def box_to_yolo_norm(box_px, img_w, img_h):
 
 
 def load_gt_excel(xlsx_path):
-    """Loads GT xlsx with deduplication and robust column detection."""
+    """Loads GT xlsx with deduplication (same as Combo 3 eval)."""
     df = pd.read_excel(xlsx_path)
     df.columns = [c.strip().lower() for c in df.columns]
-    print(f"  Excel columns (lowercased): {list(df.columns)}")
 
-    # Image column — any column that contains "image", "file", or "name"
-    img_col = next((c for c in df.columns
-                    if any(k in c for k in ("image", "file", "name", "img"))), None)
-
-    # Class column — widened to catch "class_label", "annotation", "bleeding",
-    # "label", "class", "category", "annotation_class", "target", "y"
-    cls_col = next((c for c in df.columns
-                    if any(k in c for k in
-                           ("class", "label", "bleed", "annot",
-                            "category", "target"))), None)
-    if cls_col is None:
-        raise KeyError(
-            f"Cannot find class column in xlsx. "
-            f"Available columns: {list(df.columns)}. "
-            f"Expected a column whose name contains 'class', 'label', "
-            f"'bleed', 'annot', 'category', or 'target'."
-        )
-    print(f"  Using class column: '{cls_col}'  "
-          f"sample values: {list(df[cls_col][:5])}")
-
+    # Find column names flexibly
+    img_col  = next((c for c in df.columns if "image" in c), None)
+    cls_col  = next((c for c in df.columns
+                     if c in ("class", "label", "category")), "class")
     xmin_col = next((c for c in df.columns if "xmin" in c or "x_min" in c), None)
     ymin_col = next((c for c in df.columns if "ymin" in c or "y_min" in c), None)
     xmax_col = next((c for c in df.columns if "xmax" in c or "x_max" in c), None)
     ymax_col = next((c for c in df.columns if "ymax" in c or "y_max" in c), None)
 
-    # Build key from image column, or fall back to row index
     if img_col:
         df[img_col] = df[img_col].astype(str).str.strip()
-        df["_key"]  = df[img_col].apply(lambda s: os.path.splitext(
-                          os.path.basename(s))[0])
+        df["_key"]  = df[img_col].apply(lambda s: os.path.splitext(s)[0])
         df = df.drop_duplicates(subset="_key").set_index("_key")
-        print(f"  Keys (first 5): {list(df.index[:5])}")
-    else:
-        print("  WARNING: no image column found — key matching will fail.")
 
     return df, cls_col, xmin_col, ymin_col, xmax_col, ymax_col
 
@@ -291,13 +269,8 @@ def evaluate_dataset(tag, cfg):
         if key in df.index:
             row = df.loc[key]
             if isinstance(row, pd.DataFrame):
-                row = row.iloc[0]   # take first row if duplicates remain
-            try:
-                raw_cls = int(row[cls_col])
-            except KeyError:
-                print(f"  WARNING: cls_col='{cls_col}' not in row for key={key}. "
-                      f"Row index: {list(row.index)}. Skipping.")
-                raw_cls = 1   # default to non-bleeding (safe fallback)
+                row = row.iloc[0]
+            raw_cls = int(row[cls_col])
             gt_cls  = 1 - raw_cls   # flip: xlsx 0=bleed → model 1=bleed
             box     = get_gt_box(row, xmin_col, ymin_col, xmax_col, ymax_col)
             if box is not None:

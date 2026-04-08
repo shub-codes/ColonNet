@@ -183,8 +183,11 @@ def prepare_yolo_seg_dataset(data_root, yolo_root, val_split=0.2, seed=42):
         img_path = os.path.join(img_dir, fname)
 
         # ── Bounding box ──────────────────────────────────────
+        # XML files share the same img- prefix as the image files.
+        # Only mask/annotation files use the ann- prefix.
+        # FIX: use stem directly for XML, NOT ann_stem.
         ann_stem = _img_fname_to_ann_fname(stem)
-        xml_path = os.path.join(xml_dir, ann_stem + ".xml")
+        xml_path = os.path.join(xml_dir, stem + ".xml")
         box      = _read_xml_box(xml_path)
         if box is None:
             continue   # skip images with no valid box

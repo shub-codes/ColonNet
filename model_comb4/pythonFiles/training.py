@@ -48,7 +48,7 @@ from tensorflow.keras.callbacks import (
 from sklearn.model_selection import train_test_split
 
 from utils.data_loaders import load_data
-from utils.combo4_models import build_cls_model, run_bayesian_search
+from utils.base_models import build_cls_model, run_bayesian_search
 
 # -----------------------------------------------------------------
 # GPU SETUP
@@ -126,7 +126,7 @@ def make_callbacks(path, monitor="val_loss", mode="min",
                           mode=mode, verbose=1),
     ]
 
-
+"""
 # =====================================================
 # STAGE 1 — Bayesian Optimisation
 # =====================================================
@@ -296,9 +296,8 @@ print(f"\nStage 2 complete -> {PATH_CLS}")
 tf.keras.backend.clear_session()
 gc.collect()
 
-
 # =====================================================
-# STAGE 3 — YOLOv8n-seg Training
+# STAGE 3 — YOLOv8n-seg Training  (already trained — skipped)
 # Single unified model: bounding boxes + instance masks.
 # Replaces both the Combo 3 box head (Stage 1) and
 # UNet++ segmentation (Stage 3) in a single pass.
@@ -316,7 +315,7 @@ except ImportError:
           "Run: pip install ultralytics\n  Stage 3 skipped.")
 
 if _YOLO_AVAILABLE and not os.path.exists(PATH_YOLO_PT):
-    from utils.combo4_yolo_dataset import prepare_yolo_seg_dataset
+    from utils.yolo import prepare_yolo_seg_dataset
 
     yaml_path = prepare_yolo_seg_dataset(
         data_root = DATA_ROOT,
@@ -423,7 +422,7 @@ except ImportError:
 
 print(f"\nStage 3 complete -> {PATH_YOLO_PT}")
 
-
+"""
 # =====================================================
 # STAGE 4 — Save ColonNet4 Manifest
 # =====================================================
@@ -440,6 +439,19 @@ print(f"\nStage 3 complete -> {PATH_YOLO_PT}")
 print("\n" + "=" * 55)
 print("STAGE 4 — Saving ColonNet4 Manifest")
 print("=" * 55)
+
+# Load best_hp directly from saved JSON so Stage 4 works regardless
+# of whether Stages 1+2 ran or were commented out this session.
+with open(PATH_BO) as f:
+    _hp      = json.load(f)
+best_lr      = _hp["learning_rate"]
+best_dropout = _hp["dropout"]
+best_units   = _hp["dense_units"]
+print(f"  BO params loaded → LR={best_lr:.4e}  "
+      f"dropout={best_dropout:.2f}  dense_units={best_units}")
+
+# yolo_metrics only populated when Stage 3 runs in this session
+yolo_metrics = {}
 
 cls_ok  = os.path.exists(PATH_CLS)
 yolo_ok = os.path.exists(PATH_YOLO_PT)

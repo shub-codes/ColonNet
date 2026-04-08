@@ -240,7 +240,11 @@ class LRWarmupCosineDecay(tf.keras.callbacks.Callback):
                 1, self.total_epochs - self.warmup_epochs)
             lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (
                 1 + np.cos(np.pi * progress))
-        tf.keras.backend.set_value(self.model.optimizer.lr, lr)
+        opt_lr = self.model.optimizer.learning_rate
+        try:
+            opt_lr.assign(lr)
+        except (AttributeError, TypeError):
+            self.model.optimizer.learning_rate = lr
 
 
 # ─────────────────────────────────────────────────────────────
@@ -251,27 +255,42 @@ WARMUP_EPOCHS = 10   # epochs with pure smooth-L1 before switching to IoU loss
 
 class BoxLossSwitchCallback(tf.keras.callbacks.Callback):
     """
-    At epoch WARMUP_EPOCHS, recompiles the model with combined_box_loss
-    (IoU + smooth-L1) instead of the warm-up masked_smooth_l1.
-    By this point boxes are near GT so IoU loss has non-zero gradient.
+    At the END of epoch (WARMUP_EPOCHS - 1), recompiles the model with
+    combined_box_loss (IoU + smooth-L1) instead of masked_smooth_l1.
+
+    FIX: recompile must happen in on_epoch_END (last warmup epoch), NOT
+    on_epoch_BEGIN (first IoU epoch).  Calling model.compile() inside
+    on_epoch_begin destroys the train_function that Keras already built for
+    that epoch — Keras then tries to call None on the next step and raises
+    TypeError: 'NoneType' object is not callable.
+    Recompiling at on_epoch_end gives Keras the full inter-epoch gap to
+    rebuild train_function before the next epoch starts.
     """
     def __init__(self, switch_epoch, stage1_lr, dense_units):
         super().__init__()
-        self.switch_epoch = switch_epoch
+        self.switch_epoch = switch_epoch   # = WARMUP_EPOCHS (e.g. 10)
         self.stage1_lr    = stage1_lr
         self.dense_units  = dense_units
         self._switched    = False
 
-    def on_epoch_begin(self, epoch, logs=None):
-        if epoch == self.switch_epoch and not self._switched:
+    def on_epoch_end(self, epoch, logs=None):
+        # epoch is 0-indexed; fire at the END of epoch (switch_epoch - 1)
+        # so the new loss is active from the very next epoch onward.
+        if epoch == self.switch_epoch - 1 and not self._switched:
             self._switched = True
-            print(f"\n[BoxLossSwitch] Epoch {epoch}: switching to IoU + smooth-L1 loss")
-            current_lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
+            print(f"\n[BoxLossSwitch] Epoch {epoch + 1} complete: "
+                  f"switching to IoU + smooth-L1 loss for remaining epochs")
+
+            # FIX: reuse the EXISTING optimizer — do NOT create a new one.
+            # Creating a new AdamW resets moment estimates AND produces a plain
+            # float learning_rate that LRWarmupCosineDecay cannot .assign() to,
+            # causing train_function to become None on the next epoch_begin.
+            # Passing the existing optimizer instance preserves its state and
+            # the LR variable that the warmup callback already holds a reference to.
             self.model.compile(
-                optimizer    = tf.keras.optimizers.AdamW(
-                                   learning_rate=current_lr, clipnorm=1.0),
-                loss         = LOSSES_MAIN,
-                loss_weights = {"c_final": 0.0, "b_final": 1.0},
+                optimizer=self.model.optimizer,
+                loss=LOSSES_MAIN,
+                loss_weights={"c_final": 0.0, "b_final": 1.0},
             )
 
 
@@ -466,9 +485,9 @@ model.fit(
     epochs=STAGE1_TOTAL, batch_size=8,
     callbacks=[
         EarlyStopping(monitor="val_b_final_loss", patience=12,
-                      restore_best_weights=True),
+                      restore_best_weights=True, mode="min"),
         ModelCheckpoint(PATH_BOX, monitor="val_b_final_loss",
-                        save_best_only=True),
+                        save_best_only=True,mode="min"),
         lr_schedule,
         switch_cb,
         box_iou_cb,

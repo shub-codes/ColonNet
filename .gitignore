@@ -1,15 +1,10 @@
 WCEBleedGen (updated)/
 TrainingDataset/
 TestingDatasets/
-model_comb1/SavedModels/
-model_comb2/SavedModels/
-model_comb3/SavedModels/
-model_comb3/YoloDataset/
-model_comb3/HyperbandLogs/
-model_comb2/EvalOutputs/
-model_comb1/EvalOutputs/
-model_comb3/EvalOutputs/
-
+*/YoloDataset/
+*/HyperbandLogs/
+*/SavedModels/
+*/EvalOutputs/
 .venv/
 __pycache__/
 *.pyc
