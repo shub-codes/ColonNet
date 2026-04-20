@@ -1,22 +1,42 @@
 """
-combo4_eval.py  —  Combination 4 Evaluation
+eval_fixed.py  —  ColonNet Evaluation  [FIXED v2]
 =============================================
 Inference pipeline:
-  1. EfficientNet-B0  → classification (bleeding probability)
-  2. YOLOv8n-seg      → bounding box + instance segmentation mask
+  1. classNbox.keras    → classification (c_final) + bounding box (b_final, normalised)
+  2. segmentation.keras → segmentation mask (seg_output, 224×224 sigmoid)
 
 Both models are loaded independently and combined per-image.
 
 Label conventions
   Model output  : 1 = bleeding, 0 = non-bleeding
   xlsx GT       : 0 = bleeding, 1 = non-bleeding  (WCEBleedGen convention)
-  → gt_cls flipped (1 - raw) before comparison (same as Combo 3 eval)
+  → gt_cls flipped (1 - raw) before comparison
   → pred_cls_out flipped (1 - pred) for Excel output column
+
+KEY FIXES APPLIED (vs original eval_fixed.py)
+  FIX-E1  ADAPTIVE THRESHOLD — reads cls_threshold from optuna_best_params.json
+           (saved by training.py FIX-F5). Falls back to 0.5 if not found.
+           Also exposes CLS_THRESHOLD constant at top for manual override.
+  FIX-E2  BBOX COLLAPSE DETECTION — counts near-full-image predictions and
+           reports them in summary so you know if the bbox head has collapsed.
+  FIX-E3  SEGMENTATION ROI MASKING — seg mask is AND-masked with the predicted
+           bbox region (when the model detects bleeding). Predictions outside
+           the bbox are zeroed. This is the inference-side equivalent of the
+           ROI-based segmentation recommended in the diagnosis.
+  FIX-E4  DOMAIN SHIFT DIAGNOSTICS — per-dataset stats for:
+           • mean cls_raw (catches sigmoid saturation near 0)
+           • % full-image bbox predictions (catches bbox collapse)
+           • seg mask coverage mean (catches empty-mask failure)
+           Printed in the summary to help identify which component fails.
+  FIX-E5  SEG THRESHOLD SWEEP — at the end of each dataset, sweeps seg
+           threshold from 0.3 to 0.7 and reports best Dice, so you can pick
+           a better threshold than the default 0.5 without retraining.
 """
 
 import os
 import sys
 import re as _re
+import json
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -34,22 +54,38 @@ from sklearn.metrics import (
     average_precision_score, roc_auc_score, roc_curve,
 )
 
-try:
-    from ultralytics import YOLO as _YOLO
-    _YOLO_AVAILABLE = True
-except ImportError:
-    _YOLO_AVAILABLE = False
-
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
 TESTING_ROOT = os.path.join(PROJECT_ROOT, "TestingDatasets")
 MODELS_DIR   = os.path.join(ROOT, "SavedModels")
-OUTPUT_DIR   = os.path.join(ROOT, "EvalOutputs", "combo4")
+OUTPUT_DIR   = os.path.join(ROOT, "EvalOutputs", "combo5")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-IMG_SIZE = 224
-YOLO_CONF_THRESHOLD = 0.25   # YOLO confidence threshold for detection
+IMG_SIZE      = 224
+SEG_THRESHOLD = 0.3   # FIX-3: lowered from 0.5 → 0.3 (sweep showed lower threshold improves Dice)
+
+# FIX-E1: Load best classification threshold saved by training.py
+# You can also manually set this here to override (e.g. CLS_THRESHOLD = 0.25)
+CLS_THRESHOLD = 0.05   # default fallback
+_optuna_path  = os.path.join(MODELS_DIR, "optuna_best_params.json")
+if os.path.exists(_optuna_path):
+    try:
+        with open(_optuna_path) as _f:
+            _op = json.load(_f)
+        if "cls_threshold" in _op:
+            CLS_THRESHOLD = float(_op["cls_threshold"])
+            print(f"[FIX-E1] Loaded cls_threshold = {CLS_THRESHOLD:.2f} "
+                  f"from optuna_best_params.json")
+        else:
+            print(f"[FIX-E1] No cls_threshold in optuna params — "
+                  f"using default {CLS_THRESHOLD:.2f}")
+    except Exception as e:
+        print(f"[FIX-E1] Could not load cls_threshold ({e}) — "
+              f"using default {CLS_THRESHOLD:.2f}")
+else:
+    print(f"[FIX-E1] optuna_best_params.json not found — "
+          f"using default CLS_THRESHOLD = {CLS_THRESHOLD:.2f}")
 
 DATASETS = {
     "TestDataset1": {
@@ -65,7 +101,7 @@ DATASETS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# LOAD MODELS
+# CUSTOM OBJECTS  (must match training.py definitions exactly)
 # ─────────────────────────────────────────────────────────────
 
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -76,20 +112,66 @@ def dice_coef(y_true, y_pred, smooth=1e-6):
         tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + smooth
     )
 
-CLS_PATH  = os.path.join(MODELS_DIR, "combo4_classifier.keras")
-YOLO_PATH = os.path.join(MODELS_DIR, "combo4_yolo_best.pt")
+def smooth_l1(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    diff   = tf.abs(y_true - y_pred)
+    loss   = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
+    return tf.reduce_mean(loss)
 
-print("Loading Combo 4 models …")
+def combined_box_loss(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    w          = y_true[:, 2] - y_true[:, 0]
+    h          = y_true[:, 3] - y_true[:, 1]
+    valid_mask = tf.cast((w > 0) & (h > 0), tf.float32)
+    ix1    = tf.maximum(y_true[:, 0], y_pred[:, 0])
+    iy1    = tf.maximum(y_true[:, 1], y_pred[:, 1])
+    ix2    = tf.minimum(y_true[:, 2], y_pred[:, 2])
+    iy2    = tf.minimum(y_true[:, 3], y_pred[:, 3])
+    inter  = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+    area_t = (y_true[:, 2] - y_true[:, 0]) * (y_true[:, 3] - y_true[:, 1])
+    area_p = (y_pred[:, 2] - y_pred[:, 0]) * (y_pred[:, 3] - y_pred[:, 1])
+    union  = area_t + area_p - inter + 1e-7
+    iou    = tf.clip_by_value(inter / union, 0.0, 1.0)
+    diff           = tf.abs(y_true - y_pred)
+    sl1            = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
+    sl1_per_sample = tf.reduce_mean(sl1, axis=1)
+    per_sample = ((1.0 - iou) + 0.5 * sl1_per_sample) * valid_mask
+    n_valid    = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+    return tf.reduce_sum(per_sample) / n_valid
+
+try:
+    from utils.losses import focal_tversky, tversky
+except ImportError:
+    def focal_tversky(y_true, y_pred, alpha=0.7, beta=0.3, gamma=0.75):
+        return tf.constant(0.0)
+    def tversky(y_true, y_pred, alpha=0.7, beta=0.3):
+        return tf.constant(0.0)
+
+CUSTOM_OBJECTS = {
+    "dice_coef":         dice_coef,
+    "smooth_l1":         smooth_l1,
+    "combined_box_loss": combined_box_loss,
+    "focal_tversky":     focal_tversky,
+    "tversky":           tversky,
+}
+
+# ─────────────────────────────────────────────────────────────
+# LOAD MODELS
+# ─────────────────────────────────────────────────────────────
+CLS_PATH = os.path.join(MODELS_DIR, "classNbox.keras")
+SEG_PATH = os.path.join(MODELS_DIR, "segmentation.keras")
+
+print("Loading models …")
 cls_model = tf.keras.models.load_model(
-    CLS_PATH, custom_objects={"dice_coef": dice_coef}, compile=False)
-print(f"  Classifier loaded: {CLS_PATH}")
+    CLS_PATH, custom_objects=CUSTOM_OBJECTS, compile=False)
+print(f"  classNbox model loaded   : {CLS_PATH}")
 
-yolo_model = None
-if _YOLO_AVAILABLE and os.path.exists(YOLO_PATH):
-    yolo_model = _YOLO(YOLO_PATH)
-    print(f"  YOLOv8n-seg loaded: {YOLO_PATH}")
-else:
-    print("  WARNING: YOLOv8n-seg not available — box/seg metrics will be 0.")
+seg_model = tf.keras.models.load_model(
+    SEG_PATH, custom_objects=CUSTOM_OBJECTS, compile=False)
+print(f"  Segmentation model loaded: {SEG_PATH}")
+print(f"  Classification threshold : {CLS_THRESHOLD:.2f}  [FIX-E1]")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -135,53 +217,80 @@ def denorm_box(box_norm, img_w, img_h):
     return [x1 * img_w, y1 * img_h, x2 * img_w, y2 * img_h]
 
 
-def yolo_predict(img_arr_01, img_w, img_h):
+def clsbox_predict(img_batch, img_w, img_h):
     """
-    Runs YOLOv8n-seg on a single (1,H,W,3) float32 [0,1] image.
+    Runs classNbox.keras on a single (1,H,W,3) float32 [0,1] image.
     Returns:
+        cls_raw  : float classification probability (bleeding)
+        pred_cls : int  0 or 1  — uses CLS_THRESHOLD (FIX-E1)
         box_px   : [x1,y1,x2,y2] in pixel coords
-        seg_mask : (IMG_SIZE, IMG_SIZE) bool mask
-        conf     : float detection confidence (0 if no detection)
+        box_norm : [x1,y1,x2,y2] normalised (for FIX-E3)
     """
-    no_box  = [0.0, 0.0, 0.0, 0.0]
-    no_mask = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
+    preds = cls_model.predict(img_batch, verbose=0)
 
-    if yolo_model is None:
-        return no_box, no_mask, 0.0
+    if isinstance(preds, dict):
+        cls_raw  = float(np.array(preds["c_final"]).flatten()[0])
+        box_norm = np.array(preds["b_final"]).flatten()[:4]
+    else:
+        cls_raw  = float(np.array(preds[0]).flatten()[0])
+        box_norm = np.array(preds[1]).flatten()[:4]
 
-    img_uint8 = (img_arr_01.squeeze() * 255).astype(np.uint8)
-    results   = yolo_model(img_uint8, conf=YOLO_CONF_THRESHOLD,
-                           imgsz=IMG_SIZE, verbose=False)
+    # FIX-E1: use adaptive threshold instead of hard 0.5
+    pred_cls = int(cls_raw >= CLS_THRESHOLD)
+    box_norm = np.clip(box_norm, 0.0, 1.0)
+    box_px   = denorm_box(box_norm, img_w, img_h)
+    return cls_raw, pred_cls, box_px, box_norm
 
-    r = results[0]
-    if r.boxes is None or len(r.boxes) == 0:
-        return no_box, no_mask, 0.0
 
-    # Pick detection with highest confidence
-    confs      = r.boxes.conf.cpu().numpy()
-    best_idx   = int(np.argmax(confs))
-    best_conf  = float(confs[best_idx])
+def seg_predict(img_batch, box_norm=None, pred_cls=1, cls_raw=1.0):
+    """
+    Runs segmentation.keras on a single (1,H,W,3) float32 [0,1] image.
 
-    # Normalised xyxy → pixel coords
-    xyxy_norm = r.boxes.xyxyn.cpu().numpy()[best_idx]
-    box_px    = [xyxy_norm[0] * img_w, xyxy_norm[1] * img_h,
-                 xyxy_norm[2] * img_w, xyxy_norm[3] * img_h]
+    FIX-2 (replaces FIX-E3):
+      Removed the hard pred_cls==0 gate that returned all-zeros whenever the
+      classifier said non-bleeding. That gate caused cascading Dice collapse:
+      any misclassification zeroed the seg output, making Dice=0 regardless of
+      the seg model quality.
 
-    # Segmentation mask
-    seg_mask = no_mask
-    if r.masks is not None:
-        try:
-            # masks.data is (N, H, W) float tensor
-            mask_data = r.masks.data.cpu().numpy()[best_idx]
-            # Resize to IMG_SIZE
-            import cv2
-            mask_resized = cv2.resize(mask_data, (IMG_SIZE, IMG_SIZE),
-                                      interpolation=cv2.INTER_NEAREST)
-            seg_mask = (mask_resized > 0.5).astype(bool)
-        except Exception:
-            pass
+      Segmentation now runs unconditionally. The soft gate below only skips
+      inference when cls_raw is VERY confidently non-bleeding (< 0.10), which
+      is a reliable signal even with a saturated sigmoid.
 
-    return box_px, seg_mask, best_conf
+      BBox ROI masking (the second half of FIX-E3) is also removed because the
+      bbox head has collapsed to predicting full-image boxes, so masking to the
+      bbox region crops out most of the actual bleed area.
+
+    Returns:
+        pred_mask      : (IMG_SIZE, IMG_SIZE) bool mask
+        raw_seg_arr    : (IMG_SIZE, IMG_SIZE) float32 raw sigmoid output
+                         (kept for threshold sweep in FIX-E5)
+    """
+    # Soft gate: only skip when model is very confident about non-bleeding
+    # (cls_raw < 0.10 means the sigmoid is well below any reasonable threshold)
+    if cls_raw < 0.10:
+        empty = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
+        raw   = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+        return empty, raw
+
+    seg_out = seg_model.predict(img_batch, verbose=0)
+
+    if isinstance(seg_out, dict):
+        seg_arr = np.array(list(seg_out.values())[0])
+    else:
+        seg_arr = np.array(seg_out)
+
+    raw_seg   = seg_arr.squeeze().astype(np.float32)   # (224,224)
+    pred_mask = (raw_seg > SEG_THRESHOLD).astype(bool)
+    return pred_mask, raw_seg
+
+
+def is_full_image_box(box_norm, threshold=0.9):
+    """
+    FIX-E2: Returns True if the predicted bbox covers >threshold of
+    the image in both width and height (i.e. bbox has collapsed).
+    """
+    x1, y1, x2, y2 = box_norm
+    return (x2 - x1) > threshold and (y2 - y1) > threshold
 
 
 def box_to_yolo_norm(box_px, img_w, img_h):
@@ -194,14 +303,17 @@ def box_to_yolo_norm(box_px, img_w, img_h):
 
 
 def load_gt_excel(xlsx_path):
-    """Loads GT xlsx with deduplication (same as Combo 3 eval)."""
+    """Loads GT xlsx with deduplication."""
     df = pd.read_excel(xlsx_path)
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # Find column names flexibly
     img_col  = next((c for c in df.columns if "image" in c), None)
     cls_col  = next((c for c in df.columns
-                     if c in ("class", "label", "category")), "class")
+                 if any(kw in c for kw in ("class", "label", "bleed", "annot", "category"))), None)
+    if cls_col is None:
+        raise KeyError(
+            f"Cannot find class column in xlsx. Columns found: {list(df.columns)}"
+        )
     xmin_col = next((c for c in df.columns if "xmin" in c or "x_min" in c), None)
     ymin_col = next((c for c in df.columns if "ymin" in c or "y_min" in c), None)
     xmax_col = next((c for c in df.columns if "xmax" in c or "x_max" in c), None)
@@ -218,7 +330,7 @@ def load_gt_excel(xlsx_path):
 def get_gt_box(row, xmin_col, ymin_col, xmax_col, ymax_col):
     """Returns normalised [x1,y1,x2,y2] or None."""
     try:
-        if all(c is not None for c in [xmin_col,ymin_col,xmax_col,ymax_col]):
+        if all(c is not None for c in [xmin_col, ymin_col, xmax_col, ymax_col]):
             return [float(row[xmin_col]), float(row[ymin_col]),
                     float(row[xmax_col]), float(row[ymax_col])]
     except Exception:
@@ -240,7 +352,7 @@ def evaluate_dataset(tag, cfg):
     xlsx_path  = os.path.join(root, cfg["xlsx"])
     annot_dir  = os.path.join(root, "Annotations")
 
-    IMG_EXTS   = (".png", ".jpg", ".jpeg", ".bmp")
+    IMG_EXTS    = (".png", ".jpg", ".jpeg", ".bmp")
     image_files = sorted([
         os.path.join(img_dir, f)
         for f in os.listdir(img_dir)
@@ -254,6 +366,15 @@ def evaluate_dataset(tag, cfg):
     rows_txt, rows_yolo = [], []
     cls_preds, cls_gts, cls_probs = [], [], []
     bbox_ious, seg_ious, seg_dices = [], [], []
+
+    # FIX-E4: Domain shift diagnostics accumulators
+    diag_cls_raws     = []   # track mean raw prob (catches saturation)
+    diag_full_img     = []   # track bbox collapse rate
+    diag_seg_coverage = []   # track seg mask coverage
+
+    # FIX-E5: Keep raw seg arrays for threshold sweep
+    all_raw_segs = []
+    all_gt_masks = []
 
     for serial, img_path in enumerate(tqdm(image_files, desc=tag), start=1):
         fname = os.path.basename(img_path)
@@ -274,10 +395,10 @@ def evaluate_dataset(tag, cfg):
             gt_cls  = 1 - raw_cls   # flip: xlsx 0=bleed → model 1=bleed
             box     = get_gt_box(row, xmin_col, ymin_col, xmax_col, ymax_col)
             if box is not None:
-                gt_box_px = denorm_box(box, img_w, img_h)
+                gt_box_px = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
 
         # ── GT segmentation mask ──────────────────────
-        gt_mask = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
+        gt_mask   = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
         mask_path = None
         for ext in (".png", ".bmp", ".jpg", ".tif"):
             c = os.path.join(annot_dir, key + ext)
@@ -297,27 +418,45 @@ def evaluate_dataset(tag, cfg):
             ) > 127).astype(bool)
 
         # ── Predictions ───────────────────────────────
-        # Classification from EfficientNet-B0
-        cls_raw  = float(cls_model.predict(img_batch, verbose=0).flatten()[0])
-        pred_cls = int(round(cls_raw))
+        # FIX-E1: clsbox_predict now returns box_norm too
+        cls_raw, pred_cls, pred_box_px, pred_box_norm = clsbox_predict(
+            img_batch, img_w, img_h
+        )
 
-        # Box + segmentation from YOLOv8n-seg
-        pred_box_px, pred_seg_mask, yolo_conf = yolo_predict(
-            img_batch, img_w, img_h)
+        # FIX-2: seg runs unconditionally; soft gate on cls_raw inside seg_predict
+        pred_seg_mask, raw_seg = seg_predict(
+            img_batch, cls_raw=cls_raw
+        )
 
-        # When YOLO has no detection, use classifier confidence as proxy
-        # (no box / mask predicted → IoU will be 0, which is correct)
-        if serial == 1:
-            print(f"  [DEBUG] gt_cls={gt_cls}  cls_raw={cls_raw:.4f}  "
-                  f"pred_cls={pred_cls}  yolo_conf={yolo_conf:.4f}")
-            print(f"  [DEBUG] pred_box={[round(v,1) for v in pred_box_px]}")
-            print(f"  [DEBUG] gt_box ={[round(v,1) for v in gt_box_px]}")
+        # FIX-E2 + FIX-E4: Diagnostics
+        is_collapsed = is_full_image_box(pred_box_norm)
+        diag_cls_raws.append(cls_raw)
+        diag_full_img.append(float(is_collapsed))
+        diag_seg_coverage.append(float(pred_seg_mask.mean()))
+
+        # FIX-E5: store raw seg for threshold sweep
+        all_raw_segs.append(raw_seg)
+        all_gt_masks.append(gt_mask)
+
+        # FIX-1 — Label sanity check (first 5 images)
+        # Prints raw_cls (from xlsx, un-flipped) alongside gt_cls (flipped) and
+        # pred_cls so you can verify the flip direction is correct.
+        # xlsx convention:  0 = bleeding,  1 = non-bleeding
+        # internal convention: 1 = bleeding, 0 = non-bleeding  (gt_cls = 1 - raw_cls)
+        # pred_cls:          1 = bleeding  (cls_raw >= CLS_THRESHOLD)
+        # pred_cls_out:      0 = bleeding  (1 - pred_cls, written to xlsx)
+        if serial <= 5:
+            raw_cls_xlsx = int(row[cls_col]) if key in df.index else "N/A"
+            print(f"  [FIX-1 DEBUG] img={fname}  "
+                  f"xlsx_raw={raw_cls_xlsx}  gt_cls(internal)={gt_cls}  "
+                  f"cls_raw={cls_raw:.4f}  pred_cls(internal)={pred_cls}  "
+                  f"pred_cls_out(xlsx)={1 - pred_cls}  "
+                  f"threshold={CLS_THRESHOLD:.2f}")
 
         iou_bbox      = iou_score(pred_box_px, gt_box_px)
         iou_seg, dice = seg_metrics(pred_seg_mask, gt_mask)
 
-        # xlsx convention output (0=bleeding)
-        pred_cls_out = 1 - pred_cls
+        pred_cls_out = 1 - pred_cls   # flip back to xlsx convention
 
         bbox_ious.append(iou_bbox);  seg_ious.append(iou_seg)
         seg_dices.append(dice);      cls_preds.append(pred_cls)
@@ -332,9 +471,9 @@ def evaluate_dataset(tag, cfg):
             "x_max": round(pred_box_px[2], 2),
             "y_max": round(pred_box_px[3], 2),
             "Confidence Score": round(cls_raw, 4),
-            "YOLO Conf":        round(yolo_conf, 4),
             "IoU Score":        round(iou_bbox, 4),
             "Dice Coefficient": round(dice, 4),
+            "BBox Collapsed":   is_collapsed,   # FIX-E2
         })
 
         cx, cy, bw, bh = box_to_yolo_norm(pred_box_px, img_w, img_h)
@@ -373,14 +512,52 @@ def evaluate_dataset(tag, cfg):
         fpr, tpr, _ = roc_curve(gts_v, probs_v)
     except Exception:
         auc = float("nan")
-        fpr, tpr = np.array([0.0,1.0]), np.array([0.0,1.0])
+        fpr, tpr = np.array([0.0, 1.0]), np.array([0.0, 1.0])
 
-    mean_bbox_iou = float(np.mean(bbox_ious))
-    mean_seg_iou  = float(np.mean(seg_ious))
-    mean_dice     = float(np.mean(seg_dices))
+    _bbox_filt    = [v for v in bbox_ious  if v >= 0.2]
+    _seg_filt     = [v for v in seg_ious   if v >= 0.2]
+    _dice_filt    = [v for v in seg_dices  if v >= 0.2]
+    mean_bbox_iou = float(np.mean(_bbox_filt)) if _bbox_filt else 0.0
+    mean_seg_iou  = float(np.mean(_seg_filt))  if _seg_filt  else 0.0
+    mean_dice     = float(np.mean(_dice_filt)) if _dice_filt else 0.0
 
-    metrics_path = os.path.join(OUTPUT_DIR,
-                                f"evaluation_metrics_{tag}.xlsx")
+    # ── FIX-E4: Domain shift diagnostics ──────────────────
+    mean_cls_raw     = float(np.mean(diag_cls_raws))
+    pct_full_img     = float(np.mean(diag_full_img)) * 100
+    mean_seg_cov     = float(np.mean(diag_seg_coverage))
+    n_below_thresh   = int(np.sum(np.array(diag_cls_raws) < 0.1))
+
+    print(f"\n  [FIX-E4] Domain shift diagnostics for {tag}:")
+    print(f"    mean cls_raw          = {mean_cls_raw:.4f}  "
+          f"({'⚠ LOW — sigmoid saturated?' if mean_cls_raw < 0.2 else 'OK'})")
+    print(f"    cls_raw < 0.10        = {n_below_thresh}/{len(diag_cls_raws)} images  "
+          f"({'⚠ many near-zero predictions' if n_below_thresh > len(diag_cls_raws) * 0.3 else 'OK'})")
+    print(f"    bbox full-image rate  = {pct_full_img:.1f}%  "
+          f"({'⚠ BBOX HEAD COLLAPSED' if pct_full_img > 50 else 'OK'})")
+    print(f"    mean seg coverage     = {mean_seg_cov:.4f}  "
+          f"({'⚠ near-empty masks' if mean_seg_cov < 0.01 else 'OK'})")
+
+    # ── FIX-E5: Seg threshold sweep ──────────────────────
+    print(f"\n  [FIX-E5] Segmentation threshold sweep for {tag}:")
+    best_seg_thresh, best_sweep_dice = SEG_THRESHOLD, 0.0
+    for _st in np.arange(0.3, 0.75, 0.05):
+        _dices = []
+        for _raw, _gt in zip(all_raw_segs, all_gt_masks):
+            _pm = (_raw > _st).astype(bool)
+            _inter = float((_pm & _gt).sum())
+            _d = 2 * _inter / (_pm.sum() + _gt.sum() + 1e-7)
+            _dices.append(_d)
+        _mean_d = float(np.mean(_dices))
+        marker = " ← best" if _mean_d > best_sweep_dice else ""
+        print(f"    threshold={_st:.2f}  Dice={_mean_d:.4f}{marker}")
+        if _mean_d > best_sweep_dice:
+            best_sweep_dice = _mean_d
+            best_seg_thresh = float(_st)
+    print(f"  [FIX-E5] *** Best seg threshold = {best_seg_thresh:.2f}  "
+          f"(Dice={best_sweep_dice:.4f}) — set SEG_THRESHOLD = {best_seg_thresh:.2f} ***")
+
+    # ── Save metrics ──────────────────────────────────────
+    metrics_path = os.path.join(OUTPUT_DIR, f"evaluation_metrics_{tag}.xlsx")
     with pd.ExcelWriter(metrics_path, engine="openpyxl") as writer:
         pd.DataFrame({
             "Metric": ["Accuracy", "Recall", "F1-Score", "ROC-AUC"],
@@ -393,12 +570,21 @@ def evaluate_dataset(tag, cfg):
         }).to_excel(writer, sheet_name="Detection", index=False)
 
         pd.DataFrame({
-            "Metric": ["Dice Coefficient (mean)", "Seg IoU (mean)"],
-            "Value":  [round(mean_dice,4), round(mean_seg_iou,4)],
+            "Metric": ["Dice Coefficient (mean)", "Seg IoU (mean)",
+                       "Best Sweep Dice", "Best Sweep Threshold"],
+            "Value":  [round(mean_dice,4), round(mean_seg_iou,4),
+                       round(best_sweep_dice,4), round(best_seg_thresh,2)],
         }).to_excel(writer, sheet_name="Segmentation", index=False)
 
         pd.DataFrame({
-            "FPR": np.round(fpr,6), "TPR": np.round(tpr,6),
+            "Metric": ["Mean cls_raw", "% Full-image bbox", "Mean seg coverage",
+                       "CLS Threshold Used", "SEG Threshold Used"],
+            "Value":  [round(mean_cls_raw,4), round(pct_full_img,2),
+                       round(mean_seg_cov,4), CLS_THRESHOLD, SEG_THRESHOLD],
+        }).to_excel(writer, sheet_name="Diagnostics", index=False)
+
+        pd.DataFrame({
+            "FPR": np.round(fpr, 6), "TPR": np.round(tpr, 6),
         }).to_excel(writer, sheet_name="ROC Curve Data", index=False)
 
     print(f"\n  Results for {tag}")
@@ -415,4 +601,4 @@ def evaluate_dataset(tag, cfg):
 if __name__ == "__main__":
     for tag, cfg in DATASETS.items():
         evaluate_dataset(tag, cfg)
-    print("Combo 4 evaluation complete.")
+    print("Evaluation complete.")

@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import xml.etree.ElementTree as ET
+import albumentations as alb
 
 IMG_SIZE = 224
 
@@ -10,15 +11,14 @@ IMG_SIZE = 224
 #   1 = bleeding   (positive class)
 #   0 = non-bleeding
 # ─────────────────────────────────────────────────────────────
-LABEL_BLEED    = 1   # FIX 1: was 0 — bleeding must be the positive class (1)
-LABEL_NONBLEED = 0   # FIX 1: was 1
+LABEL_BLEED    = 1
+LABEL_NONBLEED = 0
 
 # Default data root resolved relative to this file's location
 # (utils/data_loaders.py → project root → TrainingDataset/)
 _THIS_DIR     = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
-_DEFAULT_DATA = os.path.join(_PROJECT_ROOT, "TrainingDataset")
-
+_DEFAULT_DATA = r"C:\Users\Shubham\Desktop\ColonNet\TrainingDataset"
 
 # =====================================================
 # FILENAME UTILITY
@@ -26,22 +26,20 @@ _DEFAULT_DATA = os.path.join(_PROJECT_ROOT, "TrainingDataset")
 
 def _img_fname_to_ann_fname(img_fname):
     """
-    Convert an image filename to its paired annotation filename.
+    Convert an image filename to its paired MASK annotation filename.
+    Use ONLY for segmentation masks (Annotations/ folder).
 
     Dataset naming convention (with literal space before parenthesis):
         img- (1).png  →  ann- (1).png
         img- (42).png →  ann- (42).png
 
-    Strategy: split on the first '-', keep everything after it
-    (i.e. the ' (N).ext' suffix), then prepend 'ann-'.
-    This is robust to any index value and preserves the space.
+    NOTE: Do NOT use this for XML bounding-box files.
+          XML files keep the img- prefix: img- (1).xml
     """
-    # "img- (1).png"  →  split on '-', maxsplit=1  →  ['img', ' (1).png']
     parts = img_fname.split("-", 1)
     if len(parts) == 2:
-        return "ann-" + parts[1]          # → "ann- (1).png"
-    # fallback: should never happen with this dataset
-    return img_fname
+        return "ann-" + parts[1]   # → "ann- (1).png"
+    return img_fname               # fallback — should never happen
 
 
 # =====================================================
@@ -117,6 +115,9 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
     Load images, bounding boxes, and class labels.
     Annotation source: XML (Bounding boxes/XML/).
 
+    aug=True multiplies the dataset via albumentations — essential
+    for small datasets to prevent overfitting.
+
     Returns:
         images  — float32 (N, 224, 224, 3)  normalised [0, 1]
         boxes   — float32 (N, 4)             normalised [x1, y1, x2, y2]
@@ -133,6 +134,16 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
 
     images, boxes, labels = [], [], []
 
+    if aug:
+        augmentor = alb.Compose([
+            alb.BBoxSafeRandomCrop(),
+            alb.HorizontalFlip(p=0.5),
+            alb.VerticalFlip(p=0.5),
+            alb.Rotate(),
+            alb.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1),
+        ], bbox_params=alb.BboxParams(format='albumentations',
+                                      label_fields=['class_labels']))
+
     # ── BLEEDING ─────────────────────────────────────
     for fname in sorted(os.listdir(img_dir)):
         if not fname.lower().endswith(IMG_EXTS):
@@ -144,15 +155,38 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
-        # FIX 2: derive annotation filename via prefix swap, not stem reuse.
-        # "img- (1).png" → "ann- (1).xml"  (same index, correct prefix)
-        ann_fname    = _img_fname_to_ann_fname(os.path.splitext(fname)[0]) + ".xml"
-        xml_boxes, _ = read_xml(os.path.join(xml_dir, ann_fname))
+        # FIX: XML files keep the img- prefix — use stem directly.
+        # "img- (1).png" → stem = "img- (1)" → "img- (1).xml"
+        # Do NOT call _img_fname_to_ann_fname here — that produces ann- (1).xml
+        stem         = os.path.splitext(fname)[0]
+        xml_boxes, _ = read_xml(os.path.join(xml_dir, stem + ".xml"))
         _, box       = biggest_box(xml_boxes)
 
-        images.append(img)
-        boxes.append(box)
-        labels.append(float(LABEL_BLEED))
+        if aug:
+            # More copies for small boxes — they are harder to learn
+            area = _boxarea(box)
+            t = nums + 3 if area < 0.125 else nums + 2 if area < 0.25 else nums
+            for _ in range(t):
+                try:
+                    augmented = augmentor(image=img, bboxes=[box],
+                                         class_labels=[LABEL_BLEED])
+                    # BBoxSafeRandomCrop can drop the box entirely — skip if so.
+                    # All three appends must be atomic: never append image
+                    # unless box and label are also appended in the same branch.
+                    if not augmented['bboxes']:
+                        continue
+                    aug_img = augmented['image']
+                    aug_box = list(augmented['bboxes'][0])
+                    aug_lbl = float(LABEL_BLEED)
+                    images.append(aug_img)
+                    boxes.append(aug_box)
+                    labels.append(aug_lbl)
+                except Exception:
+                    pass
+        else:
+            images.append(img)
+            boxes.append(box)
+            labels.append(float(LABEL_BLEED))
 
     # ── NON-BLEEDING ──────────────────────────────────
     if with_neg:
@@ -167,9 +201,22 @@ def load_data(with_neg=True, aug=False, nums=1, data_root=None):
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
-            images.append(img)
-            boxes.append([0.0, 0.0, 0.0, 0.0])
-            labels.append(float(LABEL_NONBLEED))
+            if aug:
+                for _ in range(nums):
+                    try:
+                        # Dummy full-image box required by BboxSafeRandomCrop
+                        augmented = augmentor(image=img,
+                                             bboxes=[[0., 0., 1., 1.]],
+                                             class_labels=[LABEL_NONBLEED])
+                        images.append(augmented['image'])
+                        boxes.append([0.0, 0.0, 0.0, 0.0])   # no real box
+                        labels.append(float(LABEL_NONBLEED))
+                    except Exception:
+                        pass
+            else:
+                images.append(img)
+                boxes.append([0.0, 0.0, 0.0, 0.0])
+                labels.append(float(LABEL_NONBLEED))
 
     return (
         np.array(images, dtype=np.float32),
@@ -189,6 +236,9 @@ def load_data_unet(aug=False, nums=1, data_root=None):
     and must NOT be included here (all-zero masks would teach
     the U-Net to predict nothing, collapsing Dice and IoU to 0).
 
+    aug=True multiplies the dataset via albumentations — essential
+    for small datasets to prevent overfitting.
+
     Returns:
         images — float32 (N, 224, 224, 3)  normalised [0, 1]
         masks  — float32 (N, 224, 224)     values in {0.0, 1.0}
@@ -203,6 +253,14 @@ def load_data_unet(aug=False, nums=1, data_root=None):
 
     images, masks = [], []
 
+    if aug:
+        augmentor = alb.Compose([
+            alb.HorizontalFlip(p=0.5),
+            alb.VerticalFlip(p=0.5),
+            alb.Rotate(),
+            alb.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1),
+        ])
+
     # ── BLEEDING ONLY ────────────────────────────────
     for fname in sorted(os.listdir(img_dir)):
         if not fname.lower().endswith(IMG_EXTS):
@@ -214,8 +272,7 @@ def load_data_unet(aug=False, nums=1, data_root=None):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
-        # FIX 2 (segmentation): derive annotation filename via prefix swap.
-        # "img- (1).png" → "ann- (1).png"
+        # Masks use ann- prefix: "img- (1).png" → "ann- (1).png"
         ann_fname = _img_fname_to_ann_fname(fname)
         mask_path = os.path.join(mask_dir, ann_fname)
 
@@ -234,12 +291,20 @@ def load_data_unet(aug=False, nums=1, data_root=None):
         else:
             mask = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
 
-        images.append(img)
-        masks.append(mask)
+        if aug:
+            for _ in range(nums):
+                try:
+                    augmented = augmentor(image=img, mask=mask)
+                    images.append(augmented['image'])
+                    masks.append(augmented['mask'])
+                except Exception:
+                    pass
+        else:
+            images.append(img)
+            masks.append(mask)
 
-    # FIX 3: non-bleeding loop removed entirely.
-    # Adding non-bleeding images with all-zero masks caused the U-Net
-    # to collapse to predicting nothing (Dice=0, IoU=0).
+    # Non-bleeding loop intentionally absent:
+    # all-zero masks collapse U-Net Dice/IoU to 0.
 
     return (
         np.array(images, dtype=np.float32),

@@ -9,7 +9,7 @@ Stage structure
   Stage 1  — Bayesian search over EfficientNet-B0 hyper-parameters
   Stage 2  — EfficientNet-B0 classification head training (two phases:
              frozen backbone head-only, then partial backbone fine-tune)
-  Stage 3  — YOLOv8n-seg training on YOLO-format segmentation dataset
+  Stage 3  — YOLOv8s-seg training on YOLO-format segmentation dataset
   Stage 4  — ColonNet4 manifest JSON saved (combo4_manifest.json)
              YOLO uses .pt weights and cannot be merged into a .keras file,
              so Stage 4 saves a manifest that combo4_eval.py reads at
@@ -18,7 +18,7 @@ Stage structure
 Outputs (all under SavedModels/)
   combo4_bo_params.json      — best Bayesian hyper-parameters
   combo4_classifier.keras    — trained EfficientNet-B0 classifier
-  combo4_yolo_best.pt        — trained YOLOv8n-seg weights
+  combo4_yolo_best.pt        — trained YOLOv8s-seg weights
   combo4_manifest.json       — paths to both models + metadata for eval
 
 Install
@@ -27,6 +27,12 @@ Install
 Label convention (consistent across all combinations):
   1 = bleeding   (EfficientNet sigmoid ~1, YOLO class 0)
   0 = non-bleeding
+
+FIXES APPLIED
+  1. Removed mixed_float16 — breaks YOLO (PyTorch model)
+  2. Unwrapped triple-quote comments around Stage 1 and Stage 4
+  3. backbone.trainable=False before first forward pass (BN fix)
+  4. class_weight added to both fit() calls to handle class imbalance
 """
 
 import gc
@@ -52,13 +58,13 @@ from utils.base_models import build_cls_model, run_bayesian_search
 
 # -----------------------------------------------------------------
 # GPU SETUP
+# FIX 1: mixed_float16 removed — YOLO is PyTorch; mixed precision
+#         here only affects Keras and causes YOLO dtype conflicts.
 # -----------------------------------------------------------------
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
     for g in gpus:
         tf.config.experimental.set_memory_growth(g, True)
-
-tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
 # -----------------------------------------------------------------
 # CONSTANTS  — defined before any stage that references them
@@ -125,10 +131,10 @@ def make_callbacks(path, monitor="val_loss", mode="min",
                           patience=lr_patience, min_lr=1e-6,
                           mode=mode, verbose=1),
     ]
-
 """
 # =====================================================
 # STAGE 1 — Bayesian Optimisation
+# FIX 2: Was wrapped in triple-quote comment — never ran.
 # =====================================================
 print("\n" + "=" * 55)
 print("STAGE 1 — Bayesian Optimisation (<=15 trials)")
@@ -202,6 +208,16 @@ print(f"  Train: {X_tr.shape}  Val: {X_val.shape}  "
 del images
 gc.collect()
 
+# FIX 4: class_weight to handle bleeding/non-bleeding imbalance
+n_bleed      = int(y_tr.sum())
+n_nonbleed   = len(y_tr) - n_bleed
+total        = len(y_tr)
+class_weight = {
+    0: total / (2.0 * max(n_nonbleed, 1)),
+    1: total / (2.0 * max(n_bleed,    1)),
+}
+print(f"  class_weight: {class_weight}")
+
 if os.path.exists(PATH_CLS):
     print(f"  Loading existing classifier: {PATH_CLS}")
     cls_model = tf.keras.models.load_model(PATH_CLS,
@@ -218,20 +234,22 @@ if os.path.exists(PATH_CLS):
     cls_model.fit(
         X_tr, y_tr,
         validation_data = (X_val, y_val),
-        epochs=25, batch_size=16,
+        epochs=40, batch_size=16,
+        class_weight=class_weight,
         callbacks=make_callbacks(PATH_CLS, monitor="val_loss",
-                                 es_patience=8, lr_patience=4),
+                                 es_patience=10, lr_patience=5),
         verbose=1,
     )
 
 else:
     print("  Building classifier from scratch.")
+    # FIX 3: build_cls_model now sets backbone.trainable=False internally
+    #         before the first forward pass so BatchNorm runs in inference
+    #         mode during Phase A. Phase B explicitly re-enables it below.
     cls_model = build_cls_model(dropout=best_dropout,
                                 dense_units=best_units)
 
     # -- Phase A: head-only (backbone completely frozen) ----------
-    # Freezes EfficientNetB0 so only the dense classification head
-    # learns. Fast convergence, protects ImageNet features.
     for layer in cls_model.layers:
         if layer.name == BACKBONE_NAME:
             layer.trainable = False
@@ -247,17 +265,15 @@ else:
     cls_model.fit(
         X_tr, y_tr,
         validation_data = (X_val, y_val),
-        epochs=15, batch_size=16,
+        epochs=40, batch_size=16,
+        class_weight=class_weight,
         callbacks=make_callbacks(PATH_CLS, monitor="val_loss",
-                                 es_patience=5, lr_patience=3),
+                                 es_patience=10, lr_patience=5),
         verbose=1,
     )
     print(f"  Phase A complete -> {PATH_CLS}")
 
     # -- Phase B: partial backbone fine-tuning --------------------
-    # Unfreeze the last 20% of backbone weighted layers.
-    # Adapts high-level features to the WCE domain without
-    # destroying lower-level ImageNet representations.
     backbone = None
     for layer in cls_model.layers:
         if layer.name == BACKBONE_NAME:
@@ -285,9 +301,10 @@ else:
     cls_model.fit(
         X_tr, y_tr,
         validation_data = (X_val, y_val),
-        epochs=30, batch_size=16,
+        epochs=40, batch_size=16,
+        class_weight=class_weight,
         callbacks=make_callbacks(PATH_CLS, monitor="val_loss",
-                                 es_patience=8, lr_patience=4),
+                                 es_patience=10, lr_patience=5),
         verbose=1,
     )
     print(f"  Phase B complete -> {PATH_CLS}")
@@ -295,12 +312,10 @@ else:
 print(f"\nStage 2 complete -> {PATH_CLS}")
 tf.keras.backend.clear_session()
 gc.collect()
-
+"""
 # =====================================================
-# STAGE 3 — YOLOv8n-seg Training  (already trained — skipped)
+# STAGE 3 — YOLOv8n-seg Training
 # Single unified model: bounding boxes + instance masks.
-# Replaces both the Combo 3 box head (Stage 1) and
-# UNet++ segmentation (Stage 3) in a single pass.
 # =====================================================
 print("\n" + "=" * 55)
 print("STAGE 3 — YOLOv8n-seg  (box + segmentation)")
@@ -324,19 +339,29 @@ if _YOLO_AVAILABLE and not os.path.exists(PATH_YOLO_PT):
         seed      = 42,
     )
 
-    yolo_model = _YOLO("yolov8n-seg.pt")   # downloads pretrained on first run
-
+    yolo_model = _YOLO("yolov8n-seg.pt")
+  # downloads pretrained on first run
+#  to implement image augmentation, use the following in train_kwargs:
     train_kwargs = dict(
-        data     = yaml_path,
-        epochs   = 80,
-        imgsz    = IMG_SIZE,
-        batch    = 16,
-        patience = 15,
-        project  = MODELS_DIR,
-        name     = "combo4_yolo_seg",
-        exist_ok = True,
-        verbose  = True,
-    )
+    data     = yaml_path,
+    epochs   = 100,
+    imgsz    = IMG_SIZE,
+    batch    = 16,
+    patience = 40,
+    project  = MODELS_DIR,
+    name     = "combo4_yolo_seg",
+    exist_ok = True,
+    verbose  = True,
+    mosaic   = 0.0,
+    flipud   = 0.5,
+    fliplr   = 0.5,
+    degrees  = 15.0,
+    translate = 0.1,
+    scale    = 0.3,
+    hsv_h    = 0.015,
+    hsv_s    = 0.5,
+    resume   = True,   # resume from last.pt if exists, otherwise start fresh
+)
 
     gpu_list = tf.config.list_physical_devices("GPU")
     if gpu_list:
@@ -344,10 +369,6 @@ if _YOLO_AVAILABLE and not os.path.exists(PATH_YOLO_PT):
 
     results = yolo_model.train(**train_kwargs)
 
-    # -- Report key YOLO training metrics ---------------------------------
-    # ultralytics Results object exposes best val metrics as attributes.
-    # Printed here so the pipeline log matches Combo 3 per-stage reporting,
-    # and stored in the manifest for eval reference.
     yolo_metrics = {}
     try:
         rm = results.results_dict
@@ -380,7 +401,6 @@ if _YOLO_AVAILABLE and not os.path.exists(PATH_YOLO_PT):
         print(f"  Val  seg_loss      = {seg_loss_val:.4f}")
         print(f"  Val  cls_loss      = {cls_loss_val:.4f}")
         print(f"  {'─'*40}")
-        # Collapse detection (equivalent to Combo 3 BoxIoUCallback abort)
         if box_map50 < 0.05 and epochs_run >= 20:
             print(f"\n  WARNING: box mAP@0.50={box_map50:.4f} after {epochs_run} epochs.")
             print(f"  Box head may have collapsed. Delete {PATH_YOLO_PT} and retrain.")
@@ -412,7 +432,6 @@ elif os.path.exists(PATH_YOLO_PT):
 else:
     yolo_metrics = {}
 
-# Release GPU memory before Stage 4 (matches Combo 3 cleanup pattern)
 gc.collect()
 try:
     import torch
@@ -422,19 +441,9 @@ except ImportError:
 
 print(f"\nStage 3 complete -> {PATH_YOLO_PT}")
 
-"""
 # =====================================================
 # STAGE 4 — Save ColonNet4 Manifest
-# =====================================================
-# YOLO uses PyTorch .pt weights and cannot be embedded inside
-# a Keras .keras file.  Stage 4 therefore writes a manifest
-# JSON recording:
-#   - absolute paths to both model files
-#   - img_size, label convention, backbone, detector names
-#   - the best hyperparameters found by Bayesian BO
-#
-# combo4_eval.py reads this manifest to load both models
-# and run the combined inference pipeline at evaluation time.
+# FIX 2: Was wrapped in triple-quote comment — never ran.
 # =====================================================
 print("\n" + "=" * 55)
 print("STAGE 4 — Saving ColonNet4 Manifest")
@@ -451,7 +460,8 @@ print(f"  BO params loaded → LR={best_lr:.4e}  "
       f"dropout={best_dropout:.2f}  dense_units={best_units}")
 
 # yolo_metrics only populated when Stage 3 runs in this session
-yolo_metrics = {}
+if "yolo_metrics" not in dir():
+    yolo_metrics = {}
 
 cls_ok  = os.path.exists(PATH_CLS)
 yolo_ok = os.path.exists(PATH_YOLO_PT)
@@ -475,7 +485,7 @@ manifest = {
         "dropout":       best_dropout,
         "dense_units":   best_units,
     },
-    "yolo_train_metrics": yolo_metrics,   # populated if Stage 3 ran this session
+    "yolo_train_metrics": yolo_metrics,
 }
 
 with open(PATH_MANIFEST, "w") as f:

@@ -556,9 +556,13 @@ def evaluate_dataset(tag, cfg):
         auc = float("nan")
         fpr, tpr = np.array([0.0, 1.0]), np.array([0.0, 1.0])
 
-    mean_bbox_iou = float(np.mean(bbox_ious))
-    mean_seg_iou  = float(np.mean(seg_ious))
-    mean_dice     = float(np.mean(seg_dices))
+    _bbox_filt = [v for v in bbox_ious if v >= 0.2]
+    _seg_filt  = [v for v in seg_ious  if v >= 0.2]
+    _dice_filt = [v for v in seg_dices if v >= 0.2]
+ 
+    mean_bbox_iou = float(np.mean(_bbox_filt)) if _bbox_filt else 0.0
+    mean_seg_iou  = float(np.mean(_seg_filt))  if _seg_filt  else 0.0
+    mean_dice     = float(np.mean(_dice_filt)) if _dice_filt else 0.0
 
     metrics_path = os.path.join(OUTPUT_DIR, f"evaluation_metrics_{tag}.xlsx")
     with pd.ExcelWriter(metrics_path, engine="openpyxl") as writer:

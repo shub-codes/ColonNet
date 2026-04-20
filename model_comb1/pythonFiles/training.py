@@ -51,34 +51,43 @@ PATH_GWO   = mp("gwo_best_params.json")
 
 # ─────────────────────────────────────────────────────────────
 # LOSSES
+# FIX: Replaced GIoU with IoU + 0.5×smooth-L1.
+# GIoU can go negative → with mode="min" the checkpoint callback
+# saves the *worst* model.  IoU loss is always in [0, 1].
 # ─────────────────────────────────────────────────────────────
 
-def giou_loss(y_true, y_pred):
+def iou_smooth_l1_loss(y_true, y_pred):
     """
-    Generalised IoU loss for normalised [x1,y1,x2,y2] boxes.
-    Always cast to float32 — safe under mixed_float16 policy.
+    Combined IoU loss + 0.5 × smooth-L1 loss for normalised [x1,y1,x2,y2] boxes.
+    Range: always [0, ~1.5].  Safe under mixed_float16 policy.
     """
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
-    ix1    = tf.maximum(y_true[:, 0], y_pred[:, 0])
-    iy1    = tf.maximum(y_true[:, 1], y_pred[:, 1])
-    ix2    = tf.minimum(y_true[:, 2], y_pred[:, 2])
-    iy2    = tf.minimum(y_true[:, 3], y_pred[:, 3])
-    inter  = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+
+    # ── IoU term ──────────────────────────────────────────────
+    ix1   = tf.maximum(y_true[:, 0], y_pred[:, 0])
+    iy1   = tf.maximum(y_true[:, 1], y_pred[:, 1])
+    ix2   = tf.minimum(y_true[:, 2], y_pred[:, 2])
+    iy2   = tf.minimum(y_true[:, 3], y_pred[:, 3])
+    inter = tf.maximum(ix2 - ix1, 0.0) * tf.maximum(iy2 - iy1, 0.0)
+
     area_t = (y_true[:, 2] - y_true[:, 0]) * (y_true[:, 3] - y_true[:, 1])
     area_p = (y_pred[:, 2] - y_pred[:, 0]) * (y_pred[:, 3] - y_pred[:, 1])
     union  = area_t + area_p - inter + 1e-7
     iou    = inter / union
-    ex1    = tf.minimum(y_true[:, 0], y_pred[:, 0])
-    ey1    = tf.minimum(y_true[:, 1], y_pred[:, 1])
-    ex2    = tf.maximum(y_true[:, 2], y_pred[:, 2])
-    ey2    = tf.maximum(y_true[:, 3], y_pred[:, 3])
-    enc    = (ex2 - ex1) * (ey2 - ey1) + 1e-7
-    return tf.reduce_mean(1.0 - (iou - (enc - union) / enc))
+    iou_loss = tf.reduce_mean(1.0 - iou)   # always in [0, 1]
+
+    # ── Smooth-L1 term ────────────────────────────────────────
+    diff      = tf.abs(y_true - y_pred)
+    smooth_l1 = tf.where(diff < 1.0, 0.5 * diff ** 2, diff - 0.5)
+    sl1_loss  = tf.reduce_mean(smooth_l1)  # always ≥ 0
+
+    return iou_loss + 0.5 * sl1_loss
 
 
-LOSSES     = {"c_final": tf.keras.losses.BinaryCrossentropy(), "b_final": giou_loss}
-CUSTOM_BOX = {"giou_loss": giou_loss}
+LOSSES     = {"c_final": tf.keras.losses.BinaryCrossentropy(),
+              "b_final": iou_smooth_l1_loss}
+CUSTOM_BOX = {"iou_smooth_l1_loss": iou_smooth_l1_loss}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -153,7 +162,6 @@ def gwo_objective(pos):
     tf.keras.backend.clear_session()
     model = build_model(dropout_cls=dropout, dropout_reg=dropout,
                         dense_scale=dense_scale)
-    # FIX: weight both branches equally so LR is valid for both stages
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
         loss=LOSSES,
@@ -180,7 +188,7 @@ if os.path.exists(PATH_GWO):
           f"dropout={best_dropout:.3f}  scale={best_scale:.3f}")
 else:
     print("Starting GWO search …")
-    gwo = GreyWolfOptimizer(num_wolves=4, max_iter=2, verbose=True)
+    gwo = GreyWolfOptimizer(num_wolves=3, max_iter=4, verbose=True)
     best_pos, best_score = gwo.optimize(
         gwo_objective,
         lb=[-6.0, 0.0, 0.5],
@@ -207,9 +215,8 @@ print("\n" + "=" * 55)
 print("STAGE 1 — Bounding Box Regression")
 print("=" * 55)
 
-# Unpack as (images, boxes, labels) — labels unused this stage
 X_train, X_val, box_train, box_val, label_train, label_val = train_test_split(
-    *load_data(with_neg=False, aug=False), test_size=0.2
+    *load_data(with_neg=False, aug=True), test_size=0.2   # aug=True: needed on small dataset to avoid overfitting
 )
 
 if os.path.exists(PATH_BOX):
@@ -220,8 +227,7 @@ else:
     model = build_model(dropout_cls=best_dropout, dropout_reg=best_dropout,
                         dense_scale=best_scale)
 
-# FIX: freeze classification branch layers explicitly so gradients
-# do not update those weights during box-only training.
+# Freeze classification branch so gradients don't update those weights.
 # loss_weight=0 alone does NOT stop gradient flow.
 for layer in model.layers:
     if layer.name.startswith("c_"):
@@ -251,11 +257,9 @@ print("STAGE 2 — Classification")
 print("=" * 55)
 
 X_train, X_val, box_train, box_val, label_train, label_val = train_test_split(
-    *load_data(with_neg=True, aug=False), test_size=0.2
+    *load_data(with_neg=True, aug=True), test_size=0.2    # aug=True: needed on small dataset to avoid overfitting
 )
 
-# Always load from Stage 1 checkpoint to guarantee transfer of box weights.
-# If PATH_CLS already exists (rerun), load that instead to continue training.
 if os.path.exists(PATH_CLS):
     print(f"  Loading existing Stage 2 weights: {PATH_CLS}")
     model = load_model(PATH_CLS, custom_objects=CUSTOM_BOX)
@@ -263,7 +267,7 @@ else:
     print(f"  Fine-tuning from Stage 1: {PATH_BOX}")
     model = load_model(PATH_BOX, custom_objects=CUSTOM_BOX)
 
-# FIX: freeze box branch and backbone; only classification head trains.
+# Freeze box branch and backbone; only classification head trains.
 for layer in model.layers:
     if layer.name.startswith("b_") or layer.name == "densenet121":
         layer.trainable = False
@@ -295,7 +299,7 @@ print("STAGE 3 — Segmentation (U-Net)")
 print("=" * 55)
 
 X_train, X_val, y_train, y_val = train_test_split(
-    *load_data_unet(), test_size=0.2, shuffle=True,
+    *load_data_unet(aug=True), test_size=0.2, shuffle=True,   # aug=True: prevents mask overfitting on small bleed-only set
 )
 y_train = y_train.reshape(-1, 224, 224, 1)
 y_val   = y_val.reshape(-1, 224, 224, 1)
@@ -337,15 +341,16 @@ else:
     lower = load_model(PATH_SEG, custom_objects=SEG_CUSTOM)
 
     # FIX: iterate over .layers, not the model object directly.
-    # "for layer in model" raises TypeError; "for layer in model.layers" is correct.
     for m in (upper, lower):
         for layer in m.layers:
             layer.trainable = False
 
-    inp        = Input(shape=(224, 224, 3), name="combined_input")
+    inp              = Input(shape=(224, 224, 3), name="combined_input")
     cls_out, box_out = upper(inp)   # upper returns [c_final, b_final]
     seg_out          = lower(inp)   # lower returns seg_output
 
+    # FIX: index ColonNet outputs by string key, not integer.
+    # colon_out["c_final"] / colon_out["b_final"] / colon_out["seg_output"]
     final = Model(
         inputs=inp,
         outputs={"c_final": cls_out, "b_final": box_out, "seg_output": seg_out},

@@ -75,9 +75,13 @@ def build_cls_model(dropout=0.3, dense_units=256, weights="imagenet"):
     """
     inp      = Input(shape=(224, 224, 3), name="cls_input")
     x        = Rescaling(scale=255.0, name="rescale_0_255")(inp)
+    # In build_cls_model(), change order:
     backbone = EfficientNetB0(include_top=False, weights=weights,
-                              input_shape=(224, 224, 3))
-    backbone.trainable = True
+                            input_shape=(224, 224, 3))
+    backbone.trainable = False   # ← ADD THIS, move before backbone(x,...)
+    feats    = backbone(x, training=False)
+# REMOVE: backbone.trainable = True  (line that was there)
+    # backbone.trainable = True
     feats    = backbone(x, training=False)
     x        = GlobalAveragePooling2D(name="cls_gap")(feats)
     x        = Dense(dense_units, activation="relu", name="cls_dense1")(x)

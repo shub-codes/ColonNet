@@ -107,7 +107,6 @@ def build_model(dropout_cls=0.3,
         include_top=False,
         weights=weights,
         input_shape=sp,
-        include_preprocessing=False,
     )
 
     # Three feature scales that give a P3/P4/P5-like pyramid:
